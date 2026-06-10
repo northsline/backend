@@ -21,6 +21,8 @@ import re
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 import db
 
@@ -29,10 +31,17 @@ STICKER_RE = re.compile(r"^KNOWN-[A-Z0-9]{4}-[A-Z0-9]{4}$")
 app = Flask(__name__)
 CORS(app)
 
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per day", "50 per hour"]
+)
+
 db.init_db()
 
 
 @app.post("/activate")
+@limiter.limit("5 per minute")
 def activate():
     data = request.get_json(silent=True) or {}
     code = (data.get("sticker_code") or "").strip().upper()
