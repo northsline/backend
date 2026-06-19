@@ -17,8 +17,9 @@ import uuid
 
 import db
 
-# Sticker alphabet. (No O/0/I/1 exclusion yet — see sticker-code-system.md.)
-ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+# Sticker alphabet. O/0/I/1 removed to prevent ambiguity on printed stickers.
+# A user who can't tell O from 0 will fail activation and return the device.
+ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
 def generate_code():
@@ -26,7 +27,7 @@ def generate_code():
     return f"KNOWN-{chars[:4]}-{chars[4:]}"
 
 
-def generate_devices(count):
+def generate_devices(count, site_id=None, organization_id=None):
     db.init_db()
     created = []
     for _ in range(count):
@@ -35,7 +36,8 @@ def generate_devices(count):
             continue
         device_secret = secrets.token_hex(32)  # 256-bit
         device_id = str(uuid.uuid4())
-        db.insert_device(code, device_secret, device_id)
+        db.insert_device(code, device_secret, device_id,
+                         site_id=site_id, organization_id=organization_id)
         created.append((code, device_id))
     return created
 

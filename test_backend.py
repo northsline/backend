@@ -188,6 +188,88 @@ def test_multiple_devices():
 
     print(f"✓ test_multiple_devices: Successfully managed {count} devices")
 
+def test_count_devices_empty():
+    """count_devices returns (0, 0) on an empty DB."""
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    db.init_db(path)
+    total, claimed = db.count_devices(path)
+    assert total == 0
+    assert claimed == 0
+    os.unlink(path)
+    print("✓ test_count_devices_empty: empty db returns (0, 0)")
+
+
+def test_count_devices_with_claims():
+    """count_devices reflects the claimed/total mix."""
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    db.init_db(path)
+
+    # 3 devices, 2 claimed
+    db.insert_device("KNOWN-STAT-0001", "s1", "d1", path)
+    db.insert_device("KNOWN-STAT-0002", "s2", "d2", path)
+    db.insert_device("KNOWN-STAT-0003", "s3", "d3", path)
+    db.claim_device("KNOWN-STAT-0001", "u1", path)
+    db.claim_device("KNOWN-STAT-0002", "u2", path)
+
+    total, claimed = db.count_devices(path)
+    assert total == 3
+    assert claimed == 2
+    os.unlink(path)
+    print("✓ test_count_devices_with_claims: 3 total / 2 claimed counted correctly")
+
+
+def test_claimed_per_day_groups_by_utc_date():
+    """claimed_per_day groups by ISO date (UTC), newest first."""
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    db.init_db(path)
+
+    db.insert_device("KNOWN-PERD-0001", "s1", "d1", path)
+    db.insert_device("KNOWN-PERD-0002", "s2", "d2", path)
+    db.insert_device("KNOWN-PERD-0003", "s3", "d3", path)
+
+    with db.get_conn(path) as conn:
+        # Two claims on day A, one on day B (B is later).
+        conn.execute(
+            "UPDATE devices SET status='claimed', claimed_by='u', "
+            "claimed_at='2026-06-09T10:00:00+00:00' "
+            "WHERE sticker_code='KNOWN-PERD-0001'"
+        )
+        conn.execute(
+            "UPDATE devices SET status='claimed', claimed_by='u', "
+            "claimed_at='2026-06-09T22:00:00+00:00' "
+            "WHERE sticker_code='KNOWN-PERD-0002'"
+        )
+        conn.execute(
+            "UPDATE devices SET status='claimed', claimed_by='u', "
+            "claimed_at='2026-06-10T05:00:00+00:00' "
+            "WHERE sticker_code='KNOWN-PERD-0003'"
+        )
+        conn.commit()
+
+    days = db.claimed_per_day(path)
+    assert days == [
+        {"date": "2026-06-10", "claimed": 1},
+        {"date": "2026-06-09", "claimed": 2},
+    ], f"unexpected: {days}"
+    os.unlink(path)
+    print("✓ test_claimed_per_day_groups_by_utc_date: grouping is correct, newest first")
+
+
+def test_claimed_per_day_ignores_unclaimed():
+    """Devices with no claimed_at are not included."""
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    db.init_db(path)
+    db.insert_device("KNOWN-PERD-UNCL", "s", "d", path)
+    days = db.claimed_per_day(path)
+    assert days == []
+    os.unlink(path)
+    print("✓ test_claimed_per_day_ignores_unclaimed: unclaimed devices skipped")
+
+
 def run_tests():
     """Run all tests."""
     setup_test_db()
@@ -201,6 +283,10 @@ def run_tests():
         test_claim_device_already_claimed,
         test_sticker_code_format,
         test_multiple_devices,
+        test_count_devices_empty,
+        test_count_devices_with_claims,
+        test_claimed_per_day_groups_by_utc_date,
+        test_claimed_per_day_ignores_unclaimed,
     ]
 
     print("\n" + "="*60)
