@@ -22,6 +22,7 @@ CORS is enabled so the dashboard (a different origin in dev) can call it.
 """
 
 import logging
+import os
 import re
 import time
 
@@ -46,6 +47,25 @@ log = logging.getLogger("known-activate")
 app = Flask(__name__)
 CORS(app)
 
+# Werkzeug's dev server stamps a Server header with the framework + Python
+# version on every response. Patch BaseWSGIServer so it reports "known"
+# instead of "Werkzeug/x.y", and blank out sys_version on the request handler
+# so the Python version isn't appended. Dev-only — behind gunicorn/nginx in
+# production, the reverse proxy handles the Server header separately.
+import werkzeug.serving
+
+_orig_server_init = werkzeug.serving.BaseWSGIServer.__init__
+
+def _quiet_server_init(self, *args, **kwargs):
+    _orig_server_init(self, *args, **kwargs)
+    self._server_version = "known"
+
+werkzeug.serving.BaseWSGIServer.__init__ = _quiet_server_init
+# Override version_string() directly — the base implementation concatenates
+# server_version + ' ' + sys_version, which leaves a trailing space when
+# sys_version is blank. Return a clean string instead.
+werkzeug.serving.WSGIRequestHandler.version_string = lambda self: "known"
+
 limiter = Limiter(
     get_remote_address,
     app=app,
@@ -61,7 +81,10 @@ def rate_limited(e):
     ip = request.remote_addr or "unknown"
     log.warning("rate_limit_hit ip=%s path=%s limit=%s",
                 ip, request.path, e.description)
-    return jsonify(status="error", reason="rate_limited"), 429
+    resp = jsonify(status="error", reason="rate_limited")
+    resp.status_code = 429
+    resp.headers["Retry-After"] = "60"
+    return resp
 
 
 @app.post("/activate")
@@ -159,5 +182,6 @@ def challenge():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(host="0.0.0.0", port=8000, debug=debug)
 
