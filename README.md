@@ -1,34 +1,58 @@
-# Known Activation Backend
+# Known Backend
 
-Minimal Flask service for Known device activation. The only cloud
-surface in the product: it claims a sticker code (single-use) during USB
-provisioning. Everything else runs on-device or in the local dashboard.
+Manufacturing tools for Known devices. No server, no cloud — the backend
+directory is a toolbox for generating cryptographic keys and flashing devices.
 
-## Run (dev)
+## What's here
+
+- `keygen.py` — Generate the Northsline root key pair and per-device ECDSA
+  P-256 keys + certificates. Run `--init-root` once, then `--device` for
+  each unit.
+- `flash_known.py` — One-command manufacturing: generate device keys, flash
+  MicroPython UF2, copy firmware, burn keys to the device, verify, and
+  generate a printable serial sticker (PNG + optional A4 PDF).
+- `sticker.py` — Generate a printable device serial sticker (QR code +
+  serial number). Called automatically by `flash_known.py`, or standalone
+  for reprinting lost stickers.
+- `test_crypto_pipeline.py` — End-to-end crypto verification. Confirms the
+  pure-Python ECDSA signer (firmware) produces signatures compatible with
+  the cryptography library (same backend as Web Crypto).
+- `keys/` — Root key pair. `root_private.pem` (600 permissions, never leaves
+  this machine), `root_public.pem`, `root_public.jwk` (embedded in the PWA).
+- `stickers/` — Generated sticker PNGs, filed by serial number.
+
+## What was removed
+
+The cloud activation backend (`app.py`, `db.py`, `codes.db`, `generate_codes.py`,
+`test_backend.py`, `test_api_logic.py`) was deleted on 2026-06-20. Device
+activation is now fully offline via cryptographic challenge-response over USB.
+See `docs/internal/project/local-crypto-provisioning.md` for the design.
+
+## Setup
 
 ```bash
-pip install -r requirements.txt
-python generate_codes.py     # seed 10 test codes into codes.db
-python app.py                # http://localhost:8000
+python -m venv venv
+source venv/bin/activate
+pip install cryptography mpremote qrcode[pil]
 ```
 
-The dashboard reads its target from `VITE_API_BASE_URL` (default
-`http://localhost:8000`). Set that env var to your deployed host in production.
+## Manufacturing flow
 
-## Endpoint
+```bash
+# 1. Generate root key pair (once, ever)
+python keygen.py --init-root
+# → paste the JWK output into onboard/src/lib/root-key.ts
 
+# 2. Per device
+python flash_known.py
+# → generates keys, flashes firmware, burns keys, verifies,
+#   saves stickers/SERIAL.png (print it, stick it on the device)
+
+# 3. Reprint a lost sticker
+python sticker.py SERIAL_HEX
+python sticker.py SERIAL_HEX --pdf sheet.pdf   # A4 PDF
 ```
-POST /activate
-  body: { "sticker_code": "KNOWN-XXXX-XXXX", "user_id"?: "..." }
-  200:  { "status": "ok", "device_id": "..." }
-  400:  { "status": "error", "reason": "bad_format" }
-  404:  { "status": "error", "reason": "not_found" }
-  409:  { "status": "error", "reason": "already_claimed" }
-```
 
-## Files
+## License
 
-- `app.py` — Flask app, `POST /activate` + `GET /health`, CORS enabled.
-- `db.py` — SQLite registry schema + claim logic.
-- `generate_codes.py` — seed test devices (code + secret + id).
-- `codes.db` — generated SQLite file (gitignored).
+See the Northsline project for licensing.

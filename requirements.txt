@@ -1,3 +1,4 @@
-Flask>=3.0
-flask-cors>=4.0
-Flask-Limiter>=3.0
+cryptography>=41.0
+mpremote>=1.22
+qrcode>=8.0
+Pillow>=10.0

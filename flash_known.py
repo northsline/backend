@@ -3,29 +3,29 @@
 flash_known.py — one-command manufacturing script for Known.
 
 Does the full per-device setup in one shot:
-  1. Generate (or fetch) a sticker code + device credentials
+  1. Generate device cryptographic keys (ECDSA P-256 key pair + root-signed cert)
   2. Wait for Pico in BOOTSEL mode, flash MicroPython UF2
   3. Copy firmware (main.py + lib/) to the device
-  4. Inject /config.json with sticker_code, device_secret, device_id
-  5. Serial verify with the identify command
-  6. Print the sticker code for labeling
+  4. Inject /config.json with device token
+  5. Burn device keys (private key, public key, serial, certificate) to key storage
+  6. Serial verify with the identify command (checks keys are present)
+  7. Print the device serial number for labeling
 
 Usage:
-    python flash_known.py                    # generate a new code, flash, verify
-    python flash_known.py --code KNOWN-ABCD-1234   # use a pre-registered code
+    python flash_known.py                    # generate keys, flash, verify
     python flash_known.py --skip-uf2         # skip UF2 flash (already flashed)
 
 Requires:
     - mpremote (pip install mpremote)
     - Pico 2 W connected via USB
     - MicroPython UF2 file at ../firmware/micropython-pico2.uf2 (or pass --uf2)
-    - codes.db in backend/ (for code registration)
+    - Root key pair generated (run keygen.py --init-root first)
 
 Exit codes:
     0 = pass, device ready to ship
     1 = flash failed
     2 = file copy failed
-    3 = config injection failed
+    3 = config injection or key burn failed
     4 = serial verify failed
 """
 
@@ -172,50 +172,59 @@ def copy_firmware(port):
     return True
 
 
-def inject_config(port, sticker_code, device_secret, device_id):
-    """Write config.json to the device with the device credentials."""
+def inject_config(port):
+    """Write config.json to the device with Wi-Fi placeholder.
+    Device identity (private key, cert) is injected separately via key burn."""
     config = {
-        "sticker_code": sticker_code,
-        "device_id": device_id,
+        "device_token": secrets.token_hex(32),
     }
     config_json = json.dumps(config)
-    print(f"Injecting config.json (code={sticker_code}, id={device_id[:8]}...)...")
-    # Use exec to write the file — more reliable than fs cp from a temp file
+    print(f"Injecting config.json (device token)...")
     escaped = config_json.replace("'", "\\'")
     r = mpremote(port, "exec",
                  f"open('/config.json','w').write('{escaped}')",
                  timeout=10)
     if not r or r.returncode != 0:
         return False
-    # Verify it was written
-    r = mpremote(port, "exec",
-                 "print(open('/config.json').read())",
-                 timeout=10)
+    print("Config injected.")
+    return True
+
+
+def burn_device_keys(port, device_keys):
+    """Burn the cryptographic device keys into the Pico's key storage.
+
+    Calls otp_keys.burn_keys() on the device via mpremote exec.
+    """
+    priv_hex = device_keys['private_key'].hex()
+    pub_hex = device_keys['public_key'].hex()
+    serial_hex = device_keys['serial'].hex()
+    cert_hex = device_keys['certificate'].hex()
+
+    print(f"Burning device keys (serial={serial_hex})...")
+    exec_code = (
+        f"import otp_keys; "
+        f"otp_keys.burn_keys("
+        f"bytes.fromhex('{priv_hex}'), "
+        f"bytes.fromhex('{pub_hex}'), "
+        f"bytes.fromhex('{serial_hex}'), "
+        f"bytes.fromhex('{cert_hex}'))"
+    )
+    r = mpremote(port, "exec", exec_code, timeout=15)
     if not r or r.returncode != 0:
+        print(f"Key burn failed: {r.stderr if r else 'no response'}")
         return False
-    try:
-        written = json.loads(r.stdout.strip().strip("'"))
-        if written.get("sticker_code") != sticker_code:
-            print("Config verification failed: sticker_code mismatch")
-            return False
-    except (json.JSONDecodeError, ValueError):
-        print("Config verification failed: couldn't parse response")
-        return False
-    print("Config injected and verified.")
+    print("Device keys burned successfully.")
     return True
 
 
 def serial_verify(port):
-    """Send the identify command and check the response."""
-    print("Serial verify (identify)...")
-    # The provisioning code listens for JSON commands over serial.
-    # Send identify and check the response.
+    """Send the identify command and verify keys are present."""
+    print("Serial verify (identify + key check)...")
     r = mpremote(port, "exec",
-                 "import provisioning; "
-                 "cfg = provisioning.load_config(); "
-                 "import json; "
-                 "print(json.dumps({'status':'ok','code':cfg.get('sticker_code'),"
-                 "'device_id':cfg.get('device_id')}))",
+                 "import otp_keys, json; "
+                 "print(json.dumps({'status':'ok',"
+                 "'serial':otp_keys.get_serial(),"
+                 "'has_keys':otp_keys.has_keys()}))",
                  timeout=10)
     if not r or r.returncode != 0:
         print("Serial verify failed: no response")
@@ -225,10 +234,11 @@ def serial_verify(port):
         if resp.get("status") != "ok":
             print(f"Serial verify failed: bad status ({resp})")
             return False
-        if not resp.get("code"):
-            print("Serial verify failed: no sticker code in config")
+        if not resp.get("has_keys"):
+            print("Serial verify failed: keys not present after burn")
             return False
-        print(f"Serial verify passed: code={resp['code']}")
+        serial = resp.get("serial", "")
+        print(f"Serial verify passed: serial={serial}")
         return True
     except (json.JSONDecodeError, ValueError) as e:
         print(f"Serial verify failed: couldn't parse response ({e})")
@@ -238,35 +248,16 @@ def serial_verify(port):
 
 def main():
     parser = argparse.ArgumentParser(description="Flash + configure a Known device")
-    parser.add_argument("--code", help="Use a pre-registered sticker code")
     parser.add_argument("--uf2", default=DEFAULT_UF2,
                         help=f"Path to MicroPython UF2 (default: {DEFAULT_UF2})")
     parser.add_argument("--skip-uf2", action="store_true",
                         help="Skip UF2 flashing (device already has MicroPython)")
     args = parser.parse_args()
 
-    # Step 1: Get or create a sticker code + credentials
-    db.init_db()
-    if args.code:
-        code = args.code.strip().upper()
-        device = db.get_device(code)
-        if not device:
-            print(f"ERROR: code {code} not found in codes.db. Run generate_codes.py first.")
-            sys.exit(1)
-        if device["status"] == "claimed":
-            print(f"ERROR: code {code} already claimed.")
-            sys.exit(1)
-        sticker_code = device["sticker_code"]
-        device_secret = device["device_secret"]
-        device_id = device["device_id"]
-    else:
-        # Generate a new code
-        from generate_codes import generate_code
-        sticker_code = generate_code()
-        device_secret = secrets.token_hex(32)
-        device_id = str(uuid.uuid4())
-        db.insert_device(sticker_code, device_secret, device_id)
-        print(f"Generated new code: {sticker_code}")
+    # Step 1: Generate device cryptographic keys
+    from keygen import generate_device
+    device_keys = generate_device()
+    print(f"Generated device keys: serial={device_keys['serial_hex']}")
 
     # Step 2: Flash UF2 (or skip)
     if not args.skip_uf2:
@@ -276,7 +267,6 @@ def main():
             sys.exit(1)
         if not flash_uf2(args.uf2, mount):
             sys.exit(1)
-        # Wait for the Pico to reboot after flash
         print("Waiting for Pico to reboot after flash...")
         time.sleep(3)
 
@@ -291,12 +281,17 @@ def main():
         print("ERROR: Firmware copy failed.")
         sys.exit(2)
 
-    # Step 5: Inject config
-    if not inject_config(port, sticker_code, device_secret, device_id):
+    # Step 5: Inject config (device token only, no sticker code)
+    if not inject_config(port):
         print("ERROR: Config injection failed.")
         sys.exit(3)
 
-    # Step 6: Serial verify
+    # Step 6: Burn cryptographic keys
+    if not burn_device_keys(port, device_keys):
+        print("ERROR: Key burn failed.")
+        sys.exit(3)
+
+    # Step 7: Serial verify
     if not serial_verify(port):
         print("ERROR: Serial verification failed.")
         sys.exit(4)
@@ -305,11 +300,23 @@ def main():
     print()
     print("=" * 50)
     print("  DEVICE READY TO SHIP")
-    print(f"  Sticker code: {sticker_code}")
-    print(f"  Device ID:    {device_id}")
+    print(f"  Serial:  {device_keys['serial_hex']}")
     print("=" * 50)
     print()
-    print("Print a sticker with the code above and attach to the device.")
+
+    # Generate sticker automatically
+    try:
+        import sticker
+        sticker_path = os.path.join(sticker.STICKER_DIR,
+                                     f"{device_keys['serial_hex']}.png")
+        sticker_img = sticker.generate_sticker_image(device_keys['serial_hex'])
+        os.makedirs(sticker.STICKER_DIR, exist_ok=True)
+        sticker_img.save(sticker_path, "PNG")
+        print(f"Sticker saved:  {sticker_path}")
+        print("Print it and attach to the device.")
+    except Exception as e:
+        print(f"Sticker generation skipped (run: python sticker.py {device_keys['serial_hex']})")
+        print(f"  reason: {e}")
 
 
 if __name__ == "__main__":

@@ -2,3 +2,7 @@ codes.db
 __pycache__/
 *.pyc
 .venv/
+stickers/
+keys/
+*.pem
+*.jwk
