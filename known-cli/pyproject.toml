@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "known-cli"
+version = "0.1.0"
+description = "Terminal stats for your Known device"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Northsline" }]
+keywords = ["known", "network", "monitor", "dns", "iot"]
+
+[project.scripts]
+known = "known_cli.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]

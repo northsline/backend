@@ -6,3 +6,7 @@ stickers/
 keys/
 *.pem
 *.jwk
+known-cli/build/
+known-cli/known_cli.egg-info/
+known-cli/dist/
+*.egg-info
