@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-keygen.py — cryptographic key generation for Known devices
+keygen.py: cryptographic key generation for Known devices
 
 Generates:
-  1. The Northsline root key pair (once — keep the private key safe)
+  1. The Northsline root key pair (once: keep the private key safe)
   2. Per-device key pairs + certificates (one per device)
   3. Outputs the root public key in JWK format for embedding in the PWA
 
@@ -63,7 +63,7 @@ def init_root():
     private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
     public_key = private_key.public_key()
 
-    # Save private key (PEM, no password — protect with file permissions)
+    # Save private key (PEM, no password: protect with file permissions)
     pem_priv = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
@@ -94,7 +94,7 @@ def init_root():
         json.dump(jwk, f, indent=2)
 
     print(f"Root key pair generated:")
-    print(f"  Private: {ROOT_PRIVATE_PATH} (KEEP SECRET — protect with your life)")
+    print(f"  Private: {ROOT_PRIVATE_PATH} (KEEP SECRET: protect with your life)")
     print(f"  Public:  {ROOT_PUBLIC_PATH}")
     print(f"  JWK:     {ROOT_JWK_PATH}")
     print()

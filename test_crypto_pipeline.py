@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_crypto_pipeline.py — end-to-end crypto verification
+test_crypto_pipeline.py. End-to-end crypto verification
 
 Validates that:
   1. The root key can sign a device certificate
@@ -172,7 +172,7 @@ def test_multiple_signatures(dev_priv, dev_pub):
             dev_pub.verify(sig_der, nonce, ec.ECDSA(hashes.SHA256()))
             print(f"  Signature {i+1}: PASS ({len(sig_der)} bytes)")
         except Exception as e:
-            print(f"  Signature {i+1}: FAIL — {e}")
+            print(f"  Signature {i+1}: FAIL. {e}")
             return False
 
     print("  All 5 signatures verified successfully")

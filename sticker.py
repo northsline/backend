@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-sticker.py — generate printable device serial stickers.
+sticker.py. Generate printable device serial stickers.
 
 Produces a PNG image containing:
   - QR code encoding the device serial (16 hex chars)
@@ -35,9 +35,7 @@ def generate_sticker_image(serial_hex: str, size_mm=(50, 25), dpi=300):
     """Render a single sticker as a PIL Image.
 
     Args:
-        serial_hex: 16-char hex serial string.
-        size_mm: sticker dimensions in millimetres (w, h).
-        dpi: output resolution.
+        serial_hex: 16-char hex serial string. Size_mm: sticker dimensions in millimetres (w, h). Dpi: output resolution.
 
     Returns:
         PIL.Image (RGB).

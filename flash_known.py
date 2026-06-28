@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-flash_known.py — one-command manufacturing script for Known.
+flash_known.py. One-command manufacturing script for Known.
 
 Does the full per-device setup in one shot:
   1. Generate device cryptographic keys (ECDSA P-256 key pair + root-signed cert)
@@ -52,15 +52,13 @@ def find_pico_serial():
     candidates = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")
     if not candidates:
         return None
-    # If multiple, prefer the first — user should only have one plugged in.
-    return candidates[0]
+    # If multiple, prefer the first: user should only have one plugged in. Return candidates[0]
 
 
 def find_pico_mount():
     """Find the Pico's mass storage mount point (BOOTSEL mode)."""
     # On Linux, the Pico shows up as a block device when in BOOTSEL mode.
-    # Check mounted filesystems for something that looks like a Pico.
-    try:
+    # Check mounted filesystems for something that looks like a Pico. Try:
         with open("/proc/mounts") as f:
             for line in f:
                 parts = line.split()
@@ -97,7 +95,7 @@ def wait_for_bootsel(timeout=120):
 
 def wait_for_serial(timeout=30):
     """Wait for the Pico to appear as a serial port (after reboot)."""
-    print(f"Waiting for Pico serial port... timeout {timeout}s")
+    print(f"Waiting for Pico serial port... Timeout {timeout}s")
     start = time.time()
     while time.time() - start < timeout:
         port = find_pico_serial()

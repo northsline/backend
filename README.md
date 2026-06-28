@@ -1,6 +1,6 @@
 # Known Backend
 
-Manufacturing tools + CLI for Known devices. No server, no cloud — this
+Manufacturing tools + CLI for Known devices. No server, no cloud. This
 directory is a toolbox for generating cryptographic keys, flashing devices,
 and monitoring your network from the terminal.
 
@@ -8,21 +8,21 @@ and monitoring your network from the terminal.
 
 ### Manufacturing tools
 
-- `keygen.py` — Generate the Northsline root key pair and per-device ECDSA
+- `keygen.py`: Generate the Northsline root key pair and per-device ECDSA
   P-256 keys + certificates. Run `--init-root` once, then `--device` for
   each unit.
-- `flash_known.py` — One-command manufacturing: generate device keys, flash
+- `flash_known.py`: One-command manufacturing: generate device keys, flash
   MicroPython UF2, copy firmware, burn keys to the device, verify, and
   generate a printable serial sticker (PNG + optional A4 PDF).
-- `sticker.py` — Generate a printable device serial sticker (QR code +
+- `sticker.py`: Generate a printable device serial sticker (QR code +
   serial number). Called automatically by `flash_known.py`, or standalone
   for reprinting lost stickers.
-- `test_crypto_pipeline.py` — End-to-end crypto verification. Confirms the
+- `test_crypto_pipeline.py`: End-to-end crypto verification. Confirms the
   pure-Python ECDSA signer (firmware) produces signatures compatible with
   the cryptography library (same backend as Web Crypto).
-- `keys/` — Root key pair. `root_private.pem` (600 permissions, never leaves
+- `keys/`. Root key pair. `root_private.pem` (600 permissions, never leaves
   this machine), `root_public.pem`, `root_public.jwk` (embedded in the PWA).
-- `stickers/` — Generated sticker PNGs, filed by serial number.
+- `stickers/`. Generated sticker PNGs, filed by serial number.
 
 ### CLI tool (`known-cli/`)
 
@@ -40,7 +40,7 @@ This puts `known` on your PATH.
 **Commands:**
 
 ```
-known                       pretty summary (default — stats grid, devices, activity)
+known                       pretty summary (default: stats grid, devices, activity)
 known report                report with formatting options
 known report --table        compact table format
 known report --json         raw JSON (pipe to jq, grep, etc.)
@@ -49,7 +49,7 @@ known report --scope devices  devices only (also: stats, activity, all)
 known watch                 live refresh every 5s
 known follow <ip>           live stream of DNS queries from one device
 known diff                  what changed since last run (snapshot-based)
-known monitor               silent check — exit 0 if OK, exit 1 if alert
+known monitor               silent check: exit 0 if OK, exit 1 if alert
 known allow add <pattern>   add allowlist entry
 known allow rm <id>         remove allowlist entry
 known allow ls              list allowlist entries
@@ -60,12 +60,12 @@ known --host 192.168.1.42   manual device IP (skip mDNS)
 **What the CLI can do that the dashboard can't:**
 
 - Follow a single device's queries in real time (`known follow`)
-- Detect what changed between runs (`known diff` — saves snapshot to ~/.known-snapshot)
-- Alert in cron jobs and shell prompts (`known monitor` — exit code based)
+- Detect what changed between runs (`known diff`: saves snapshot to ~/.known-snapshot)
+- Alert in cron jobs and shell prompts (`known monitor`: exit code based)
 - Pipe to other tools (`known report --json | jq ...`)
 - Manage the allowlist faster than clicking through UI
 
-**Discovery:** Same logic as the dashboard — tries `known.local` first,
+**Discovery:** Same logic as the dashboard. Tries `known.local` first,
 falls back to saved IP in `~/.known-host`, then manual `--host`.
 
 ## What was removed

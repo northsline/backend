@@ -1,5 +1,5 @@
 """
-known — terminal stats for your Known device.
+known. Terminal stats for your Known device.
 
 Usage:
     known                       pretty summary (default)
@@ -192,11 +192,11 @@ def fmt_num(n):
 
 def fmt_time(ts):
     if not ts:
-        return "—"
+        return "-"
     try:
         return time.strftime("%H:%M:%S", time.localtime(ts))
     except Exception:
-        return "—"
+        return "-"
 
 
 def fmt_duration(seconds):
@@ -214,7 +214,7 @@ def fmt_duration(seconds):
 
 def fmt_ago(ts):
     if not ts:
-        return "—"
+        return "-"
     delta = time.time() - ts
     if delta < 60:
         return "just now"
@@ -250,7 +250,7 @@ def pretty_header(ip, subtitle=None):
 
 def pretty_stats(stats):
     if "error" in stats:
-        print(f"  {C.RED}stats unavailable — {stats['error']}{C.RESET}")
+        print(f"  {C.RED}stats unavailable. {stats['error']}{C.RESET}")
         print()
         return
 
@@ -293,7 +293,7 @@ def pretty_stats(stats):
 def pretty_devices(devices_data):
     if not devices_data or "error" in devices_data:
         if devices_data and "error" in devices_data:
-            print(f"  {C.RED}devices unavailable — {devices_data['error']}{C.RESET}")
+            print(f"  {C.RED}devices unavailable. {devices_data['error']}{C.RESET}")
         else:
             print(f"  {C.MUTED}no devices seen yet{C.RESET}")
         print()
@@ -308,7 +308,7 @@ def pretty_devices(devices_data):
 
     for d in devs:
         name = truncate(d.get("name", "?"), 21)
-        ip   = d.get("ip", "—")
+        ip   = d.get("ip", "-")
         q    = d.get("query_count", 0)
         ago  = fmt_ago(d.get("last_seen", 0))
         ago_c = f"{C.MUTED}{ago}{C.RESET}"
@@ -320,7 +320,7 @@ def pretty_devices(devices_data):
 def pretty_activity(audit_data, limit=15):
     if not audit_data or "error" in audit_data:
         if audit_data and "error" in audit_data:
-            print(f"  {C.RED}log unavailable — {audit_data['error']}{C.RESET}")
+            print(f"  {C.RED}log unavailable. {audit_data['error']}{C.RESET}")
         else:
             print(f"  {C.MUTED}no queries logged yet{C.RESET}")
         print()
@@ -335,8 +335,8 @@ def pretty_activity(audit_data, limit=15):
 
     for e in entries:
         t   = fmt_time(e.get("timestamp", 0))
-        src = truncate(e.get("source", "—"), 15)
-        dom = truncate(e.get("domain", "—"), 36)
+        src = truncate(e.get("source", "-"), 15)
+        dom = truncate(e.get("domain", "-"), 36)
         print(f"  {C.MUTED}{pad(t, 10)}{C.RESET} {pad(src, 16)} {dom}")
 
     if len(audit_data) > limit:
@@ -360,14 +360,14 @@ def render_pretty(ip, stats, devices, audit, scope="all"):
 def render_table(ip, stats, devices, audit, scope="all"):
     if scope in ("all", "stats"):
         if "error" in stats:
-            print(f"stats: error — {stats['error']}")
+            print(f"stats: error. {stats['error']}")
         else:
             total_q   = stats.get("total_queries", 0)
             domains   = stats.get("unique_domains", 0)
             dev_count = stats.get("device_count", 0)
             flagged   = stats.get("flagged_count", 0)
             period    = stats.get("period_start", 0)
-            uptime    = fmt_duration(time.time() - period) if period else "—"
+            uptime    = fmt_duration(time.time() - period) if period else "-"
             print(f"  queries    domains    devices    flagged    uptime")
             print(f"  {fmt_num(total_q):<10} {fmt_num(domains):<10} {dev_count:<10} {flagged:<10} {uptime}")
             print()
@@ -375,7 +375,7 @@ def render_table(ip, stats, devices, audit, scope="all"):
     if scope in ("all", "devices"):
         if not devices or "error" in devices:
             if devices and "error" in devices:
-                print(f"devices: error — {devices['error']}")
+                print(f"devices: error. {devices['error']}")
             else:
                 print("  no devices")
             print()
@@ -385,7 +385,7 @@ def render_table(ip, stats, devices, audit, scope="all"):
             print(f"  {'─' * 68}")
             for d in devs:
                 name = truncate(d.get("name", "?"), 22)
-                ip   = d.get("ip", "—")
+                ip   = d.get("ip", "-")
                 q    = d.get("query_count", 0)
                 ago  = fmt_ago(d.get("last_seen", 0))
                 print(f"  {pad(name, 24)} {pad(ip, 16)} {str(q).rjust(8)}    {ago}")
@@ -394,7 +394,7 @@ def render_table(ip, stats, devices, audit, scope="all"):
     if scope in ("all", "activity"):
         if not audit or "error" in audit:
             if audit and "error" in audit:
-                print(f"activity: error — {audit['error']}")
+                print(f"activity: error. {audit['error']}")
             else:
                 print("  no queries")
             print()
@@ -404,8 +404,8 @@ def render_table(ip, stats, devices, audit, scope="all"):
             print(f"  {'─' * 68}")
             for e in entries:
                 t   = fmt_time(e.get("timestamp", 0))
-                src = truncate(e.get("source", "—"), 16)
-                dom = truncate(e.get("domain", "—"), 38)
+                src = truncate(e.get("source", "-"), 16)
+                dom = truncate(e.get("domain", "-"), 38)
                 print(f"  {pad(t, 12)} {pad(src, 18)} {dom}")
             if len(audit) > 20:
                 print(f"  +{len(audit) - 20} more")
@@ -422,7 +422,7 @@ def render_compact(ip, stats, devices, audit, scope="all"):
     dev_count = stats.get("device_count", 0)
     flagged   = stats.get("flagged_count", 0)
     period    = stats.get("period_start", 0)
-    uptime    = fmt_duration(time.time() - period) if period else "—"
+    uptime    = fmt_duration(time.time() - period) if period else "-"
 
     parts = [
         f"known · {ip}",
@@ -545,7 +545,7 @@ def cmd_follow(args):
 
             for e in new:
                 t = fmt_time(e.get("timestamp", 0))
-                dom = e.get("domain", "—")
+                dom = e.get("domain", "-")
                 print(f"  {C.MUTED}{t}{C.RESET}  {dom}")
 
             time.sleep(FOLLOW_INTERVAL)
@@ -597,10 +597,10 @@ def cmd_diff(args):
     previous = load_snapshot()
 
     if not previous:
-        # First run — save and report baseline
+        # First run: save and report baseline
         save_snapshot(current)
         pretty_header(ip, "diff · baseline")
-        print(f"  {C.MUTED}no previous snapshot — saved baseline{C.RESET}")
+        print(f"  {C.MUTED}no previous snapshot. Saved baseline{C.RESET}")
         print()
         print(f"  {C.BOLD}{fmt_num(current['total_queries'])}{C.RESET} {C.MUTED}queries{C.RESET}")
         print(f"  {C.BOLD}{len(current['device_ips'])}{C.RESET} {C.MUTED}devices{C.RESET}")
@@ -689,7 +689,7 @@ def cmd_diff(args):
             print(f"    {C.FAINT}+{more} more{C.RESET}")
         print()
 
-    # Removed domains (usually noise — devices stopped querying something)
+    # Removed domains (usually noise: devices stopped querying something)
     if removed_domains:
         show = sorted(removed_domains)[:10]
         more = len(removed_domains) - len(show)
@@ -702,7 +702,7 @@ def cmd_diff(args):
 
     # If flagged increased, highlight it
     if flagged_delta > 0:
-        print(f"  {C.AMBER}⚠  flagged count increased — check dashboard{C.RESET}")
+        print(f"  {C.AMBER}⚠  flagged count increased. Check dashboard{C.RESET}")
         print()
 
 
@@ -753,7 +753,7 @@ def cmd_monitor(args):
             print(f"known: {a}")
         sys.exit(1)
     else:
-    # Silent on success — composable with cron
+    # Silent on success: composable with cron
         sys.exit(0)
 
 
@@ -776,7 +776,7 @@ def cmd_allow(args):
             sys.exit(1)
         result = fetch(ip, "/allowlist", method="PUT", data={"pattern": pattern})
         if "error" in result:
-            print(f"  {C.RED}failed — {result['error']}{C.RESET}")
+            print(f"  {C.RED}failed. {result['error']}{C.RESET}")
             sys.exit(1)
         print(f"  {C.GREEN}●{C.RESET}  {C.BOLD}{pattern}{C.RESET} {C.MUTED}added to allowlist{C.RESET}")
         if result.get("id"):
@@ -790,7 +790,7 @@ def cmd_allow(args):
             sys.exit(1)
         result = fetch(ip, f"/allowlist/{entry_id}", method="DELETE")
         if "error" in result:
-            print(f"  {C.RED}failed — {result['error']}{C.RESET}")
+            print(f"  {C.RED}failed. {result['error']}{C.RESET}")
             sys.exit(1)
         print(f"  {C.GREEN}●{C.RESET}  {C.MUTED}removed {entry_id}{C.RESET}")
         print()
@@ -799,7 +799,7 @@ def cmd_allow(args):
         entries = fetch(ip, "/allowlist")
         if not isinstance(entries, list):
             if "error" in entries:
-                print(f"  {C.RED}failed — {entries['error']}{C.RESET}")
+                print(f"  {C.RED}failed. {entries['error']}{C.RESET}")
             else:
                 print(f"  {C.MUTED}allowlist empty{C.RESET}")
             print()
