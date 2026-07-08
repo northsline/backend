@@ -44,9 +44,6 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FIRMWARE_DIR = os.path.join(SCRIPT_DIR, "..", "known", "firmware")
 DEFAULT_UF2 = os.path.join(FIRMWARE_DIR, "micropython-pico2.uf2")
 
-import db
-
-
 def find_pico_serial():
     """Find the Pico's serial port (/dev/ttyACMx on Linux)."""
     candidates = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")
@@ -301,21 +298,6 @@ def main():
     print(f"  Serial:  {device_keys['serial_hex']}")
     print("=" * 50)
     print()
-
-    # Generate sticker automatically
-    try:
-        import sticker
-        sticker_path = os.path.join(sticker.STICKER_DIR,
-                                     f"{device_keys['serial_hex']}.png")
-        sticker_img = sticker.generate_sticker_image(device_keys['serial_hex'])
-        os.makedirs(sticker.STICKER_DIR, exist_ok=True)
-        sticker_img.save(sticker_path, "PNG")
-        print(f"Sticker saved:  {sticker_path}")
-        print("Print it and attach to the device.")
-    except Exception as e:
-        print(f"Sticker generation skipped (run: python sticker.py {device_keys['serial_hex']})")
-        print(f"  reason: {e}")
-
 
 if __name__ == "__main__":
     main()
