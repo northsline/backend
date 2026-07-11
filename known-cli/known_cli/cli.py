@@ -177,11 +177,16 @@ def fetch(ip, path, method="GET", data=None):
 
 
 def fetch_all(ip):
-    return (
+    stats, devices, audit = (
         fetch(ip, "/stats"),
         fetch(ip, "/devices"),
         fetch(ip, "/audit/weekly?limit=30"),
     )
+    # /devices is now a wrapper {pico_mac, devices: [...]}. unwrap for
+    # back-compat with older firmware that returned a bare array.
+    if isinstance(devices, dict) and "devices" in devices:
+        devices = devices["devices"]
+    return stats, devices, audit
 
 
 # ── formatting helpers ─────────────────────────────────────────────────
@@ -509,6 +514,10 @@ def cmd_follow(args):
     # Resolve device name if we can
     dev_name = target
     devices = fetch(ip, "/devices")
+    # /devices is now a wrapper {pico_mac, devices: [...]}. unwrap for
+    # back-compat with older firmware that returned a bare array.
+    if isinstance(devices, dict) and "devices" in devices:
+        devices = devices["devices"]
     if isinstance(devices, list):
         for d in devices:
             if d.get("ip") == target:
