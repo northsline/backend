@@ -55,7 +55,8 @@ def find_pico_serial():
 def find_pico_mount():
     """Find the Pico's mass storage mount point (BOOTSEL mode)."""
     # On Linux, the Pico shows up as a block device when in BOOTSEL mode.
-    # Check mounted filesystems for something that looks like a Pico. Try:
+    # Check mounted filesystems for something that looks like a Pico.
+    try:
         with open("/proc/mounts") as f:
             for line in f:
                 parts = line.split()
@@ -186,16 +187,54 @@ def inject_config(port):
 
 
 def burn_device_keys(port, device_keys):
-    """Burn the cryptographic device keys into the Pico's key storage.
-
-    Calls otp_keys.burn_keys() on the device via mpremote exec.
-    """
+    # burn the cryptographic device keys into the Pico's key storage.
+    # calls otp_keys.burn_keys() on the device via mpremote exec, then
+    # performs a separate read-back verify to confirm what landed in
+    # storage matches what we intended to burn.
     priv_hex = device_keys['private_key'].hex()
     pub_hex = device_keys['public_key'].hex()
     serial_hex = device_keys['serial'].hex()
     cert_hex = device_keys['certificate'].hex()
+    expected_serial = device_keys['serial_hex']
 
     print(f"Burning device keys (serial={serial_hex})...")
+
+    # step 1: confirm the device is using the OTP backend, not the flash
+    # fallback. a device that ended up on the flash path cannot ship:
+    # its key is readable via BOOTSEL mass storage.
+    r = mpremote(port, "exec",
+                 "import otp_keys; print(otp_keys._BACKEND)",
+                 timeout=10)
+    if not r or r.returncode != 0:
+        print(f"Backend check failed: {r.stderr if r else 'no response'}")
+        return False
+    backend = r.stdout.strip().strip("'").strip('"')
+    if backend != "otp":
+        print(f"ERROR: device backend is '{backend}', not 'otp'.")
+        print("  The flash fallback is for development only -- it is")
+        print("  readable via BOOTSEL. Do not ship a device on the flash")
+        print("  backend. Re-flash a MicroPython build that exposes")
+        print("  machine.OTP and re-run flash_known.py.")
+        return False
+    print(f"  backend: {backend}")
+
+    # step 2: refuse to re-burn a device that already has keys. OTP is
+    # one-time-write and we cannot tell apart "burned today" from
+    # "burned last month" -- the safe move is to fail loudly.
+    r = mpremote(port, "exec",
+                 "import otp_keys; print(otp_keys.has_keys())",
+                 timeout=10)
+    if not r or r.returncode != 0:
+        print(f"Pre-burn check failed: {r.stderr if r else 'no response'}")
+        return False
+    if r.stdout.strip().strip("'").strip('"').lower() == "true":
+        print("ERROR: device already has keys burned. OTP is one-time-write.")
+        print("  Use a fresh Pico, or accept that this device cannot be")
+        print("  re-keyed. Its current keys remain valid -- it is just")
+        print("  not the keys we just generated.")
+        return False
+
+    # step 3: burn.
     exec_code = (
         f"import otp_keys; "
         f"otp_keys.burn_keys("
@@ -208,7 +247,68 @@ def burn_device_keys(port, device_keys):
     if not r or r.returncode != 0:
         print(f"Key burn failed: {r.stderr if r else 'no response'}")
         return False
-    print("Device keys burned successfully.")
+
+    # step 4: separate read-back verify. burn_keys() does its own
+    # internal verify-back; this is a defense-in-depth check from
+    # outside the burn function, so a bug in burn_keys cannot silently
+    # pass a bad burn.
+    if not verify_burn(port, device_keys):
+        return False
+
+    print("Device keys burned and verified.")
+    return True
+
+
+def verify_burn(port, device_keys):
+    # read every field back from the device and compare byte-for-byte
+    # against the keys we intended to burn. this is the last line of
+    # defense before the device ships.
+    fields = [
+        # (label, attr, expected_string)
+        # private_key/public_key/certificate are bytes -- the device
+        # hex-encodes them for transmission. serial is already a hex
+        # string on the device, returned as-is.
+        ("private", "private_key", device_keys['private_key'].hex()),
+        ("public", "public_key", device_keys['public_key'].hex()),
+        ("serial", "serial", device_keys['serial_hex']),
+        ("certificate", "certificate", device_keys['certificate'].hex()),
+    ]
+
+    for label, attr, expected_str in fields:
+        # read back the field and ask the device to print it as hex
+        # (or, for serial which is already a hex string, just print it).
+        if attr == "serial":
+            script = (f"import otp_keys; "
+                      f"v = otp_keys.get_serial(); "
+                      f"print(v if v else '')")
+        else:
+            script = (f"import ubinascii, otp_keys; "
+                      f"v = otp_keys.get_{attr}(); "
+                      f"print(ubinascii.hexlify(v).decode() if v else '')")
+        r = mpremote(port, "exec", script, timeout=10)
+        if not r or r.returncode != 0:
+            print(f"  read-back of {label} failed: "
+                  f"{r.stderr if r else 'no response'}")
+            return False
+        actual = r.stdout.strip()
+        if actual != expected_str:
+            print(f"  read-back mismatch on {label}:")
+            print(f"    expected: {expected_str[:80]}{'...' if len(expected_str) > 80 else ''}")
+            print(f"    got:      {actual[:80]}{'...' if len(actual) > 80 else ''}")
+            return False
+
+    # has_keys() must be true after the burn
+    r = mpremote(port, "exec",
+                 "import otp_keys; print(otp_keys.has_keys())",
+                 timeout=10)
+    if not r or r.returncode != 0:
+        print(f"  has_keys check failed: {r.stderr if r else 'no response'}")
+        return False
+    if r.stdout.strip().lower() != "true":
+        print("  read-back: has_keys() is False after burn")
+        return False
+
+    print("  read-back verify: all fields match")
     return True
 
 
@@ -276,7 +376,15 @@ def main():
         print("ERROR: Firmware copy failed.")
         sys.exit(2)
 
-    # Step 5: Inject config (device token only, no sticker code)
+    # Step 5: Inject config (device token only).
+    #
+    # sticker_code was removed 2026-06-20 when crypto attestation replaced
+    # the old sticker-code activation system. The device is now authenticated
+    # via ECDSA P-256 challenge-response (see keygen.py + otp_keys.py).
+    #
+    # Existing devices that still have sticker_code in their config.json
+    # will lose it naturally on next re-provision. No migration script needed
+    # -- the old key is harmless and the firmware doesn't read it.
     if not inject_config(port):
         print("ERROR: Config injection failed.")
         sys.exit(3)
