@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-keygen.py: cryptographic key generation for Known devices
+keygen.py: cryptographic key generation for Heron devices
 
 Generates:
   1. The Northsline root key pair (once: keep the private key safe)
@@ -165,7 +165,7 @@ def generate_device(serial_hex: str = None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Known cryptographic key generation")
+    parser = argparse.ArgumentParser(description="Heron cryptographic key generation")
     parser.add_argument('--init-root', action='store_true',
                         help='Generate the Northsline root key pair (run once)')
     parser.add_argument('--device', action='store_true',

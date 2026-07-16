@@ -137,7 +137,7 @@ def test_burn_fails_on_burn_keys_failure():
 
 
 def main():
-    print("Known flash_known burn flow tests")
+    print("Heron flash_known burn flow tests")
     print("==================================")
     print()
     test_burn_rejects_flash_backend()
@@ -153,7 +153,7 @@ def main():
     print("  1. Build the custom MicroPython UF2 with the OTP C module")
     print("     (see rp2350-otp-c-module skill).")
     print("  2. Flash a sacrificial Pico 2 W with the custom UF2.")
-    print("  3. Run an OTP smoke test: write a known byte, read it back,")
+    print("  3. Run an OTP smoke test: write a heron byte, read it back,")
     print("     compare. Must succeed before proceeding.")
     print("  4. Run: python flash_known.py with a throwaway key pair.")
     print("  5. Confirm the printout says 'backend: otp' and 'read-back")

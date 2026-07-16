@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-flash_known.py. One-command manufacturing script for Known.
+flash_known.py. One-command manufacturing script for Heron.
 
 Does the full per-device setup in one shot:
   1. Generate device cryptographic keys (ECDSA P-256 key pair + root-signed cert)
@@ -41,7 +41,7 @@ import uuid
 
 # Resolve paths relative to this script (lives in backend/).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-FIRMWARE_DIR = os.path.join(SCRIPT_DIR, "..", "known", "firmware")
+FIRMWARE_DIR = os.path.join(SCRIPT_DIR, "..", "heron", "firmware")
 DEFAULT_UF2 = os.path.join(FIRMWARE_DIR, "micropython-pico2.uf2")
 
 def find_pico_serial():
@@ -342,7 +342,7 @@ def serial_verify(port):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Flash + configure a Known device")
+    parser = argparse.ArgumentParser(description="Flash + configure a Heron device")
     parser.add_argument("--uf2", default=DEFAULT_UF2,
                         help=f"Path to MicroPython UF2 (default: {DEFAULT_UF2})")
     parser.add_argument("--skip-uf2", action="store_true",

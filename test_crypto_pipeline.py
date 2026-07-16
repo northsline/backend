@@ -180,7 +180,7 @@ def test_multiple_signatures(dev_priv, dev_pub):
 
 
 def main():
-    print("Known Crypto Pipeline Test")
+    print("Heron Crypto Pipeline Test")
     print("==========================")
     print()
 

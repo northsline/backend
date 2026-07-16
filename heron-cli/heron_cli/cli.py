@@ -1,20 +1,20 @@
 """
-known. Terminal stats for your Known device.
+heron. Terminal stats for your Heron device.
 
 Usage:
-    known                       pretty summary (default)
-    known report --table        compact table format
-    known report --json         raw JSON
-    known report --compact      one-line summary
-    known watch                 live refresh every 5s
-    known follow <ip>           live stream for one device
-    known diff                  what changed since last run
-    known monitor               silent check, exit 1 if alert
-    known allow add <pattern>   add allowlist entry
-    known allow rm <id>         remove allowlist entry
-    known allow ls              list allowlist entries
-    known debug                 raw internal state
-    known --host 192.168.1.42   manual device IP
+    heron                       pretty summary (default)
+    heron report --table        compact table format
+    heron report --json         raw JSON
+    heron report --compact      one-line summary
+    heron watch                 live refresh every 5s
+    heron follow <ip>           live stream for one device
+    heron diff                  what changed since last run
+    heron monitor               silent check, exit 1 if alert
+    heron allow add <pattern>   add allowlist entry
+    heron allow rm <id>         remove allowlist entry
+    heron allow ls              list allowlist entries
+    heron debug                 raw internal state
+    heron --host 192.168.1.42   manual device IP
 """
 
 import argparse
@@ -30,9 +30,9 @@ from urllib.error import URLError, HTTPError
 # ── config ──────────────────────────────────────────────────────────────
 
 PORT = 8080
-MDNS = "known.local"
-SAVE_FILE = os.path.join(os.path.expanduser("~"), ".known-host")
-SNAPSHOT_FILE = os.path.join(os.path.expanduser("~"), ".known-snapshot")
+MDNS = "heron.local"
+SAVE_FILE = os.path.join(os.path.expanduser("~"), ".heron-host")
+SNAPSHOT_FILE = os.path.join(os.path.expanduser("~"), ".heron-snapshot")
 WATCH_INTERVAL = 5
 FOLLOW_INTERVAL = 2
 MONITOR_INTERVAL = 10
@@ -133,7 +133,7 @@ def discover_with_loading(host=None):
     if host:
         msg = f"connecting to {host}…"
     else:
-        msg = "scanning for known.local…"
+        msg = "scanning for heron.local…"
     sp = threading.Thread(target=spinner, args=(msg, done), daemon=True)
     sp.start()
 
@@ -244,7 +244,7 @@ def pad(s, width):
 
 def pretty_header(ip, subtitle=None):
     print()
-    print(f"  {C.BOLD}Known{C.RESET}", end="")
+    print(f"  {C.BOLD}Heron{C.RESET}", end="")
     if subtitle:
         print(f"  {C.FAINT}·{C.RESET}  {C.MUTED}{subtitle}{C.RESET}")
     else:
@@ -419,7 +419,7 @@ def render_table(ip, stats, devices, audit, scope="all"):
 
 def render_compact(ip, stats, devices, audit, scope="all"):
     if "error" in stats:
-        print(f"known · {ip} · error: {stats['error']}")
+        print(f"heron · {ip} · error: {stats['error']}")
         return
 
     total_q   = stats.get("total_queries", 0)
@@ -430,7 +430,7 @@ def render_compact(ip, stats, devices, audit, scope="all"):
     uptime    = fmt_duration(time.time() - period) if period else "-"
 
     parts = [
-        f"known · {ip}",
+        f"heron · {ip}",
         f"{fmt_num(total_q)} queries",
         f"{fmt_num(domains)} domains",
         f"{dev_count} devices",
@@ -471,14 +471,14 @@ def run_report(ip, fmt, scope):
 
 def view_not_found():
     print()
-    print(f"  {C.BOLD}Known{C.RESET}")
+    print(f"  {C.BOLD}Heron{C.RESET}")
     print()
     print(f"  {C.RED}●{C.RESET}  not found")
     print()
-    print(f"  {C.MUTED}tried known.local + saved ip{C.RESET}")
-    print(f"  {C.MUTED}make sure Known is powered on and on your network{C.RESET}")
+    print(f"  {C.MUTED}tried heron.local + saved ip{C.RESET}")
+    print(f"  {C.MUTED}make sure Heron is powered on and on your network{C.RESET}")
     print()
-    print(f"  {C.FAINT}try:{C.RESET}  {C.DIM}known --host 192.168.1.42{C.RESET}")
+    print(f"  {C.FAINT}try:{C.RESET}  {C.DIM}heron --host 192.168.1.42{C.RESET}")
     print()
 
 
@@ -525,7 +525,7 @@ def cmd_follow(args):
                 break
 
     clear()
-    print(f"  {C.BOLD}Known{C.RESET}  {C.FAINT}·{C.RESET}  {C.MUTED}following{C.RESET}")
+    print(f"  {C.BOLD}Heron{C.RESET}  {C.FAINT}·{C.RESET}  {C.MUTED}following{C.RESET}")
     print(f"  {C.MUTED}{dev_name}{C.RESET}  {C.FAINT}({target}){C.RESET}")
     print(f"  {C.FAINT}{'─' * 52}{C.RESET}")
     print(f"  {C.FAINT}waiting for queries…  ctrl+c to stop{C.RESET}")
@@ -615,7 +615,7 @@ def cmd_diff(args):
         print(f"  {C.BOLD}{len(current['device_ips'])}{C.RESET} {C.MUTED}devices{C.RESET}")
         print(f"  {C.BOLD}{len(current['domains'])}{C.RESET} {C.MUTED}domains{C.RESET}")
         print()
-        print(f"  {C.FAINT}run `known diff` again to see what changed{C.RESET}")
+        print(f"  {C.FAINT}run `heron diff` again to see what changed{C.RESET}")
         print()
         return
 
@@ -723,7 +723,7 @@ def cmd_monitor(args):
     ip = discover_with_loading(args.host)
     if not ip:
         # Device unreachable is an alert
-        print(f"known: device unreachable")
+        print(f"heron: device unreachable")
         sys.exit(1)
 
     stats, devices, audit = fetch_all(ip)
@@ -759,7 +759,7 @@ def cmd_monitor(args):
 
     if alerts:
         for a in alerts:
-            print(f"known: {a}")
+            print(f"heron: {a}")
         sys.exit(1)
     else:
     # Silent on success: composable with cron
@@ -881,21 +881,21 @@ def cmd_debug(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="known",
-        description="terminal stats for your Known device",
+        prog="heron",
+        description="terminal stats for your Heron device",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "commands:\n"
-            "  known                       pretty summary (default)\n"
-            "  known report                report with formatting options\n"
-            "  known watch                 live refresh every 5s\n"
-            "  known follow <ip>           live stream for one device\n"
-            "  known diff                  what changed since last run\n"
-            "  known monitor               silent check, exit 1 if alert\n"
-            "  known allow add <pattern>   add allowlist entry\n"
-            "  known allow rm <id>         remove allowlist entry\n"
-            "  known allow ls              list allowlist entries\n"
-            "  known debug                 raw internal state\n"
+            "  heron                       pretty summary (default)\n"
+            "  heron report                report with formatting options\n"
+            "  heron watch                 live refresh every 5s\n"
+            "  heron follow <ip>           live stream for one device\n"
+            "  heron diff                  what changed since last run\n"
+            "  heron monitor               silent check, exit 1 if alert\n"
+            "  heron allow add <pattern>   add allowlist entry\n"
+            "  heron allow rm <id>         remove allowlist entry\n"
+            "  heron allow ls              list allowlist entries\n"
+            "  heron debug                 raw internal state\n"
             "\n"
             "report formats:\n"
             "  --table / --json / --compact\n"
@@ -904,11 +904,11 @@ def main():
             "  --scope all / stats / devices / activity\n"
             "\n"
             "examples:\n"
-            "  known report --table\n"
-            "  known follow 192.168.1.20\n"
-            "  known diff\n"
-            "  known monitor && echo 'all clear'\n"
-            "  known allow add *.doubleclick.net\n"
+            "  heron report --table\n"
+            "  heron follow 192.168.1.20\n"
+            "  heron diff\n"
+            "  heron monitor && echo 'all clear'\n"
+            "  heron allow add *.doubleclick.net\n"
         ),
     )
     parser.add_argument("--host", metavar="IP", help="manual device IP (skip mDNS)")
