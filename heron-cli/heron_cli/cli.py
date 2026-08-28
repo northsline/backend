@@ -13,11 +13,17 @@ Usage:
     heron allow add <pattern>   add allowlist entry
     heron allow rm <id>         remove allowlist entry
     heron allow ls              list allowlist entries
+    heron release --version N   build a signed firmware bundle
+    heron update                auto-apply newest bundle from ~/.heron/updates/
+    heron update <file>         apply a specific .heronpkg
+    heron update --list         list available bundles and eligibility
     heron debug                 raw internal state
     heron --host 192.168.1.42   manual device IP
 """
 
+
 import argparse
+import glob
 import json
 import os
 import socket
@@ -27,12 +33,15 @@ import time
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 
+from . import bundle, update
+
 # ── config ──────────────────────────────────────────────────────────────
 
 PORT = 8080
 MDNS = "heron.local"
 SAVE_FILE = os.path.join(os.path.expanduser("~"), ".heron-host")
 SNAPSHOT_FILE = os.path.join(os.path.expanduser("~"), ".heron-snapshot")
+UPDATES_DIR = os.path.join(os.path.expanduser("~"), ".heron", "updates")
 WATCH_INTERVAL = 5
 FOLLOW_INTERVAL = 2
 MONITOR_INTERVAL = 10
@@ -492,6 +501,74 @@ def view_debug(ip):
 
 
 # ════════════════════════════════════════════════════════════════════════
+# FEATURE: version
+# ════════════════════════════════════════════════════════════════════════
+
+def _load_local_bundles():
+    """Return sorted list of (path, parsed_bundle) for local update bundles."""
+    os.makedirs(UPDATES_DIR, exist_ok=True)
+    paths = glob.glob(os.path.join(UPDATES_DIR, "*.heronpkg"))
+    bundles = []
+    for path in sorted(paths):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            parsed = bundle.parse_bundle(data, public_key=None)
+            bundles.append((path, parsed))
+        except Exception:
+            continue
+    return bundles
+
+
+def _newest_bundle_version(bundles):
+    if not bundles:
+        return None
+    return max(parsed.fw_version for _, parsed in bundles)
+
+
+def cmd_version(args):
+    ip = discover_with_loading(args.host)
+    if not ip:
+        view_not_found()
+        sys.exit(1)
+
+    info = fetch(ip, "/version")
+    if "error" in info:
+        print()
+        print(f"  {C.BOLD}Version{C.RESET}")
+        print()
+        print(f"  {C.RED}●{C.RESET}  could not read firmware version")
+        print(f"  {C.MUTED}{info['error']}{C.RESET}")
+        print()
+        return
+
+    fw_version = info.get("fw_version", "?")
+    has_update_key = info.get("has_update_key", False)
+    active_slot = info.get("active_slot", "?")
+
+    bundles = _load_local_bundles()
+    newest = _newest_bundle_version(bundles)
+
+    print()
+    print(f"  {C.BOLD}Version{C.RESET}")
+    print()
+    print(f"  {C.MUTED}firmware:{C.RESET}      {C.BOLD}{fw_version}{C.RESET}")
+    print(f"  {C.MUTED}update key:{C.RESET}    {C.BOLD}{'yes' if has_update_key else 'no'}{C.RESET}")
+    print(f"  {C.MUTED}active slot:{C.RESET}   {C.BOLD}{active_slot}{C.RESET}")
+    print()
+
+    if newest is None:
+        print(f"  {C.MUTED}no local update bundles{C.RESET}")
+        print()
+    elif newest > fw_version:
+        print(f"  {C.AMBER}●{C.RESET}  Update available: v{newest}  {C.MUTED}(current: v{fw_version}){C.RESET}")
+        print()
+    else:
+        print(f"  {C.GREEN}●{C.RESET}  Up to date")
+        print()
+
+
+# ════════════════════════════════════════════════════════════════════════
 # FEATURE: follow
 # ════════════════════════════════════════════════════════════════════════
 
@@ -877,6 +954,46 @@ def cmd_debug(args):
     view_debug(ip)
 
 
+def cmd_release(args):
+    firmware_dir = os.path.abspath(args.dir)
+    if not os.path.isdir(firmware_dir):
+        print(f"ERROR: firmware directory not found: {firmware_dir}")
+        sys.exit(1)
+
+    private_key_path = os.path.abspath(args.sign)
+    if not os.path.exists(private_key_path):
+        print(f"ERROR: update private key not found: {private_key_path}")
+        sys.exit(1)
+
+    out_dir = os.path.abspath(args.out)
+    os.makedirs(out_dir, exist_ok=True)
+
+    out_pkg = os.path.join(out_dir, f"heron-fw-{args.version}.heronpkg")
+    out_manifest = os.path.join(out_dir, f"heron-fw-{args.version}.manifest.json")
+
+    bundle.bundle_from_directory(
+        directory=firmware_dir,
+        fw_version=args.version,
+        min_from=args.min_from,
+        private_key=private_key_path,
+        output_path=out_pkg,
+    )
+
+    # Re-parse to write a human-readable manifest companion.
+    with open(out_pkg, "rb") as f:
+        pkg_data = f.read()
+    parsed = bundle.parse_bundle(pkg_data)
+    with open(out_manifest, "w") as f:
+        json.dump(parsed.manifest, f, indent=2)
+
+    print(f"Built signed firmware bundle:")
+    print(f"  Package:  {out_pkg} ({len(pkg_data)} bytes)")
+    print(f"  Manifest: {out_manifest}")
+    print(f"  Version:  {parsed.fw_version}")
+    print(f"  Min from: {parsed.min_from}")
+    print(f"  Files:    {len(parsed.manifest['files'])}")
+
+
 # ── entry point ───────────────────────────────────────────────────────
 
 def main():
@@ -893,9 +1010,14 @@ def main():
             "  heron diff                  what changed since last run\n"
             "  heron monitor               silent check, exit 1 if alert\n"
             "  heron allow add <pattern>   add allowlist entry\n"
-            "  heron allow rm <id>         remove allowlist entry\n"
-            "  heron allow ls              list allowlist entries\n"
+        "  heron allow rm <id>         remove allowlist entry\n"
+        "  heron allow ls              list allowlist entries\n"
+            "  heron release --version N   build a signed firmware bundle\n"
+            "  heron update                auto-apply newest bundle from ~/.heron/updates/\n"
+            "  heron update <file>         apply a specific .heronpkg\n"
+            "  heron update --list         list available bundles and eligibility\n"
             "  heron debug                 raw internal state\n"
+            "  heron version               firmware version + update availability\n"
             "\n"
             "report formats:\n"
             "  --table / --json / --compact\n"
@@ -951,6 +1073,20 @@ def main():
     # debug
     sub.add_parser("debug", help="raw internal state")
 
+    # release
+    p_release = sub.add_parser("release", help="build a signed .heronpkg from a firmware tree")
+    p_release.add_argument("--version", type=int, required=True, help="firmware version number")
+    p_release.add_argument("--min-from", type=int, default=1, help="minimum device firmware version that can apply this bundle")
+    p_release.add_argument("--sign", required=True, help="path to the update private key PEM")
+    p_release.add_argument("--dir", default=".", help="directory containing main.py + lib/ (default: current directory)")
+    p_release.add_argument("--out", default="dist", help="output directory (default: dist/)")
+
+    # version
+    sub.add_parser("version", help="firmware version + update availability")
+
+    # update
+    update.add_subparser(sub)
+
     args = parser.parse_args()
 
     if args.command == "report":
@@ -965,8 +1101,14 @@ def main():
         cmd_monitor(args)
     elif args.command == "allow":
         cmd_allow(args)
+    elif args.command == "release":
+        cmd_release(args)
+    elif args.command == "update":
+        update.cmd_update(args)
     elif args.command == "debug":
         cmd_debug(args)
+    elif args.command == "version":
+        cmd_version(args)
     else:
         # no subcommand: default pretty report
         ip = discover_with_loading(args.host)
