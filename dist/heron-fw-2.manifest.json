@@ -1,0 +1,62 @@
+{
+  "fw_version": 2,
+  "min_from": 1,
+  "created_at": 1786311994,
+  "files": [
+    {
+      "path": "lib/devices.py",
+      "size": 9441,
+      "sha256": "399282c444b22a37b7cf64caffdaad298daca57b4b76e4adb2e35c35bb83181a"
+    },
+    {
+      "path": "lib/dns_diag.py",
+      "size": 8251,
+      "sha256": "a6c831b6e43ea98d06ef1601eb65da4ba91e847434f3282f6767071211972b73"
+    },
+    {
+      "path": "lib/dns_monitor.py",
+      "size": 11608,
+      "sha256": "5a9bf293a8369554e148981faea76e7b0c4e2dabf03ea997c35b9770bfaa6071"
+    },
+    {
+      "path": "lib/ecdsa.py",
+      "size": 4907,
+      "sha256": "4e82beb51fa88b4734f7401227f09419030b714606f8936405159a553175d628"
+    },
+    {
+      "path": "lib/http_server.py",
+      "size": 14702,
+      "sha256": "ffab928833c4092bc4f897505d1d53974a52b187e9ce7bf85de986fd334987c2"
+    },
+    {
+      "path": "lib/names_store.py",
+      "size": 796,
+      "sha256": "8867221bd5c6c8f0e0572f29fc3cce9738288b876df3df0a8af0ab69631008a9"
+    },
+    {
+      "path": "lib/otp_keys.py",
+      "size": 14176,
+      "sha256": "a952e86f8240bf9baea2c0c93e1854da41f01b9f84636fa4dc166455faf65103"
+    },
+    {
+      "path": "lib/provisioning.py",
+      "size": 9487,
+      "sha256": "a1ef8b3042f8e1876c25b4caa65ae5d6578bd5a5db9d5acce9b78761d8f795b0"
+    },
+    {
+      "path": "lib/ssd1306.py",
+      "size": 2640,
+      "sha256": "7a10245dc17f67212728989eb5d119cc44b621d72fcbe3866dab954b60714b54"
+    },
+    {
+      "path": "lib/ups.py",
+      "size": 5985,
+      "sha256": "cd52644e36838b8f6ffe4156526b886fd384009f9acac1904742c7e1ceccc9b4"
+    },
+    {
+      "path": "main.py",
+      "size": 23329,
+      "sha256": "a6626cc69420417ace83e1c834f4d5c21d44fdd3d4304c3454c8526bf3bccf09"
+    }
+  ]
+}

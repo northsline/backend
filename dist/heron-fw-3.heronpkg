@@ -1,0 +1,2740 @@
+HRNPF0D ,â¬<q	ßì×wÀ\F8¨•îNã
+‹âá»"M HËÑ7ÉÉ3$_)ž7€^ºÅ¯	&i DµúÒÂWø-{"fw_version":3,"min_from":1,"created_at":1786281177,"files":[{"path":"lib/devices.py","size":9441,"sha256":"399282c444b22a37b7cf64caffdaad298daca57b4b76e4adb2e35c35bb83181a"},{"path":"lib/dns_diag.py","size":8251,"sha256":"a6c831b6e43ea98d06ef1601eb65da4ba91e847434f3282f6767071211972b73"},{"path":"lib/dns_monitor.py","size":11608,"sha256":"5a9bf293a8369554e148981faea76e7b0c4e2dabf03ea997c35b9770bfaa6071"},{"path":"lib/ecdsa.py","size":4907,"sha256":"4e82beb51fa88b4734f7401227f09419030b714606f8936405159a553175d628"},{"path":"lib/http_server.py","size":13780,"sha256":"5d2ee84ca8519623bc6c7d40544d2d2ec60df6a7cd8c19f77990854475cdf10f"},{"path":"lib/names_store.py","size":796,"sha256":"8867221bd5c6c8f0e0572f29fc3cce9738288b876df3df0a8af0ab69631008a9"},{"path":"lib/otp_keys.py","size":9649,"sha256":"a42c41f30379b982f1b6d7987b185246e6b937ad636a4a1c63338022c362bd41"},{"path":"lib/provisioning.py","size":9487,"sha256":"a1ef8b3042f8e1876c25b4caa65ae5d6578bd5a5db9d5acce9b78761d8f795b0"},{"path":"lib/ssd1306.py","size":2640,"sha256":"7a10245dc17f67212728989eb5d119cc44b621d72fcbe3866dab954b60714b54"},{"path":"lib/ups.py","size":5985,"sha256":"cd52644e36838b8f6ffe4156526b886fd384009f9acac1904742c7e1ceccc9b4"},{"path":"main.py","size":20263,"sha256":"d778572b15431a456da2bd0d98c74f4197a1050e633b249c34ab963ac596f935"}]}# device tracker: keeps a registry of LAN devices seen in dns queries.
+# keyed by source ip. hostname via nbns broadcast, fallback to "device #n".
+# mac lookup is best effort -- rp2350 micropython has no arp api, may stay none.
+import socket
+import struct
+import time
+
+try:
+    import ubinascii
+except ImportError:  # running on cpython for tests
+    ubinascii = None
+
+try:
+    import names_store
+except ImportError:
+    names_store = None
+
+
+def format_mac(raw):
+    # format 6 raw bytes from wlan.config('mac') as colon-separated hex.
+    # returns "aa:bb:cc:dd:ee:ff" lowercase, or raises ValueError on bad input.
+    # the cyw43 driver exposes the pico's own mac as 6 bytes; this is what
+    # the dashboard's oui.ts lookupVendor() expects on the wire.
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) != 6:
+        raise ValueError("mac must be 6 bytes, got {}".format(
+            type(raw).__name__ if not isinstance(raw, (bytes, bytearray)) else len(raw)
+        ))
+    return ":".join("{:02x}".format(b) for b in raw)
+
+
+def _try_reverse_dns(ip):
+    # best-effort reverse dns. rarely works on micropython, kept as a long shot.
+    try:
+        name, _, _ = socket.gethostbyaddr(ip)
+    except Exception:
+        return None
+    if not name or name == ip:
+        return None
+    return name
+
+
+def _nbns_query_name(ip):
+    # send a netbios name service query to the broadcast addr on udp 137.
+    # windows boxes, printers, samba iot things usually answer. one shot, short timeout.
+    try:
+        parts = ip.split(".")
+        if len(parts) != 4:
+            return None
+        bcast = ".".join(parts[:3]) + ".255"
+
+        # transaction id 0x1337, flags 0x1000 (recursion desired).
+        # one question: name "*" (wildcard), type NB (0x0020), class IN (0x0001).
+        # netbios names are 16 chars padded with spaces, then length-prefixed.
+        nb_name = b"*".ljust(16)  # pad to 16
+        # encode as first-level netbios name: each char -> two nibbles + 'A' (0x41)
+        encoded = b""
+        for c in nb_name:
+            encoded += bytes([0x41 + (c >> 4), 0x41 + (c & 0x0F)])
+        question = bytes([len(encoded)]) + encoded + struct.pack(">HH", 0x0020, 0x0001)
+
+        pkt = struct.pack(">HHHHHH", 0x1337, 0x1000, 1, 0, 0, 0) + question
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # enable broadcast
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except Exception:
+            pass
+        s.settimeout(300)  # ms on micropython
+        s.sendto(pkt, (bcast, 137))
+        try:
+            data, _ = s.recvfrom(1024)
+        except Exception:
+            s.close()
+            return None
+        s.close()
+
+        # response: tid(2) flags(2) qd(2) an(2) ns(2) ar(2) then answers.
+        if len(data) < 12:
+            return None
+        flags, qd, an = struct.unpack(">HHH", data[2:8])
+        if an == 0:
+            return None
+        off = 12
+        # skip questions
+        for _ in range(qd):
+            off = _skip_name(data, off)
+            off += 4  # type + class
+        # parse first answer
+        off = _skip_name(data, off)
+        if off + 10 > len(data):
+            return None
+        rtype, _rclass, _ttl, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+        off += 10
+        if rtype != 0x0020 or rdlen < 18:
+            return None
+        # rdata: flags(2) + name(16) ... take the 16-byte netbios name.
+        nb_name_raw = data[off + 2:off + 18]
+        # strip trailing spaces and nulls
+        name = nb_name_raw.rstrip(b" \x00").decode("ascii", "ignore")
+        return name or None
+    except Exception:
+        return None
+
+
+def _skip_name(data, off):
+    # walk a dns/netbios name (with possible compression pointers) and return next offset.
+    while True:
+        if off >= len(data):
+            return off
+        n = data[off]
+        if n == 0:
+            return off + 1
+        if (n & 0xC0) == 0xC0:
+            return off + 2
+        off += 1 + n
+
+
+def _lookup_mac(ip):
+    # rp2350 micropython has no arp table api and no /proc. try a couple things,
+    # but expect none on stock firmware. returns "aa:bb:..." string or none.
+    # try /proc/net/arp first -- works on cpython test hosts, not on the pico.
+    try:
+        with open("/proc/net/arp", "r") as f:
+            for line in f:
+                cols = line.split()
+                if len(cols) >= 6 and cols[0] == ip:
+                    mac = cols[3]
+                    if mac != "00:00:00:00:00:00" and mac != "FF:FF:FF:FF:FF:FF":
+                        return mac
+    except Exception:
+        pass
+    # no clean arp api on micropython. leaving none here; a future build
+    # could do a raw arp exchange but the lwip stack doesn't expose it.
+    return None
+
+
+MAX_NAME_LEN = 32
+
+
+class DeviceTracker:
+    def __init__(self):
+        self.devices = {}  # key: ip string, value: dict
+        self._next_id = 1  # monotonic, used for "device #n" fallback names
+        self._saved_names = {}  # ip -> custom name, loaded from flash on boot
+
+    def load_saved_names(self):
+        # load names from flash and apply to devices we already know about.
+        # called once on boot after wifi connects. devices that show up later
+        # in record() will check self._saved_names too.
+        if names_store is None:
+            return
+        self._saved_names = names_store.load_names()
+        for ip, name in self._saved_names.items():
+            if ip in self.devices:
+                self.devices[ip]["custom_name"] = name
+                self.devices[ip]["name"] = name
+
+    def record(self, ip, domain, timestamp, flagged=False):
+        if ip not in self.devices:
+            # hostname: try reverse dns (usually fails), then nbns broadcast.
+            # fall back to "device #n" with a stable insertion-order number.
+            friendly = _try_reverse_dns(ip)
+            if not friendly:
+                friendly = _nbns_query_name(ip)
+            if not friendly:
+                friendly = "Device #" + str(self._next_id)
+            # mac: best effort, likely none on rp2350. exposed for oui lookup anyway.
+            mac = _lookup_mac(ip)
+            # if we have a saved custom name for this ip, use it.
+            custom_name = None
+            if ip in self._saved_names:
+                custom_name = self._saved_names[ip]
+                friendly = custom_name
+            self.devices[ip] = {
+                "id": str(hash(ip) & 0x7FFFFFFF),  # positive hash
+                "ip": ip,
+                "name": friendly,
+                "mac": mac,
+                "first_seen": timestamp,
+                "trust_level": "unknown",
+                "query_count": 0,
+                "flagged_count": 0,
+            }
+            if custom_name is not None:
+                self.devices[ip]["custom_name"] = custom_name
+            self._next_id += 1
+        d = self.devices[ip]
+        d["last_seen"] = timestamp
+        d["query_count"] += 1
+        # if mac was missed on first pass, try again later
+        if d.get("mac") is None:
+            mac = _lookup_mac(ip)
+            if mac:
+                d["mac"] = mac
+        # if we still have a "device #n" name, retry nbns -- answers can be slow
+        if d["name"].startswith("Device #"):
+            nb = _nbns_query_name(ip)
+            if nb:
+                d["name"] = nb
+        if flagged:
+            d["flagged_count"] += 1
+
+    def get_all(self):
+        out = []
+        for d in self.devices.values():
+            item = {
+                "id": d["id"],
+                "ip": d["ip"],
+                "name": d["name"],
+                "mac": d.get("mac"),
+                "first_seen": d["first_seen"],
+                "last_seen": d.get("last_seen"),
+                "trust_level": d["trust_level"],
+                "query_count": d["query_count"],
+                "flagged_count": d["flagged_count"],
+            }
+            # include custom_name if a user has set one
+            if d.get("custom_name") is not None:
+                item["custom_name"] = d["custom_name"]
+            out.append(item)
+        return out
+
+    def rename(self, ip, new_name):
+        # set both the user-facing name and the persistent custom_name override.
+        # saves to flash so the name survives reboots.
+        if ip not in self.devices:
+            return False
+        # cap at MAX_NAME_LEN so a runaway client can't fill flash with a single
+        # rename. rejected names leave the device's existing name untouched.
+        if len(new_name) > MAX_NAME_LEN:
+            return False
+        self.devices[ip]["custom_name"] = new_name
+        self.devices[ip]["name"] = new_name
+        if names_store is not None:
+            self._saved_names[ip] = new_name
+            if not names_store.save_names(self._saved_names):
+                print("name save failed for", ip)
+        return True
+
+    def get_stats(self):
+        return {
+            "total_queries": sum(d["query_count"] for d in self.devices.values()),
+            "unique_domains": 0,  # computed in http_server from dns_requests
+            "flagged_count": sum(d["flagged_count"] for d in self.devices.values()),
+            "device_count": len(self.devices),
+            "period_start": min(
+                (d["first_seen"] for d in self.devices.values()), default=0
+            ),
+        }import socket
+import select
+import time
+
+
+def _now_ms():
+    return time.ticks_ms()
+
+
+def _log(tag, msg):
+    # Tagged print so output is easy to grep.
+    print("[{}] {}".format(tag, msg))
+
+
+def test_listen(bind_ip="0.0.0.0", port=53, wait_s=8):
+    # T1: just bind and wait. If nothing comes in, the network path is broken.
+    _log("T1", "binding {}:{} ...".format(bind_ip, port))
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind((bind_ip, port))
+        s.settimeout(wait_s)   # one long timeout, not a tight loop
+    except Exception as e:
+        _log("T1", "FAIL bind: {}".format(e))
+        return None, None
+
+    _log("T1", "Bound. Waiting up to {}s for any packet...".format(wait_s))
+    try:
+        data, addr = s.recvfrom(512)
+        if data:
+            _log("T1", "PASS got {}B from {}".format(len(data), addr))
+            s.close()
+            return data, addr
+    except OSError as e:
+        _log("T1", "FAIL recvfrom: {}".format(e))
+    except Exception as e:
+        _log("T1", "FAIL unexpected: {}".format(e))
+    finally:
+        s.close()
+
+    _log("T1", "FAIL no packet in {}s".format(wait_s))
+    return None, None
+
+
+def test_echo(bind_ip="0.0.0.0", port=53, wait_s=30):
+    # T2: echo server. Run nslookup from a PC and see if the Pico gets it.
+    # if nothing shows up, it's AP isolation or wrong IP, not the firmware.
+    _log("T2", "starting echo server on {}:{} for {}s".format(
+        bind_ip, port, wait_s))
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind((bind_ip, port))
+        s.settimeout(1)
+    except Exception as e:
+        _log("T2", "FAIL bind: {}".format(e))
+        return
+
+    deadline = _now_ms() + wait_s * 1000
+    echoed = 0
+    while time.ticks_diff(deadline, _now_ms()) > 0:
+        try:
+            data, addr = s.recvfrom(512)
+        except Exception:
+            continue
+        if not data:
+            continue
+        _log("T2", "rcv {}B from {} (txid=0x{:04x})".format(
+            len(data), addr, (data[0] << 8) | data[1]))
+        try:
+            s.sendto(data, addr)
+            echoed += 1
+            _log("T2", "echoed back to {} (count={})".format(addr, echoed))
+        except Exception as e:
+            _log("T2", "sendto FAIL: {}".format(e))
+    s.close()
+    _log("T2", "Done. Echoed {} packets".format(echoed))
+
+
+def test_upstream(host="1.1.1.1", port=53, timeout_s=5):
+    # T3: send a real query to 1.1.1.1. If this fails, the router is
+    # blocking outbound DNS to public resolvers.
+    # Hand-crafted DNS query for "cloudflare.com" A record.
+    # Header: id=0x1234, RD=1, 1 question.
+    # \x12\x34   txid
+    # \x01\x00   standard query, RD
+    # \x00\x01   1 question
+    # \x00\x00\x00\x00\x00\x00  rest of header
+    # \x0a cloudflare \x03 com \x00  question
+    # \x00\x01   type A
+    # \x00\x01   class IN
+    q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    q += b"\x0acloudflare\x03com\x00"
+    q += b"\x00\x01\x00\x01"
+
+    _log("T3", "sending {}B to {}:{} (timeout {}s)".format(
+        len(q), host, port, timeout_s))
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout_s)
+        s.sendto(q, (host, port))
+        data, addr = s.recvfrom(512)
+        s.close()
+    except Exception as e:
+        _log("T3", "FAIL: {}".format(e))
+        return False
+
+    if len(data) < 12:
+        _log("T3", "FAIL response too short: {}B".format(len(data)))
+        return False
+    rcode = data[3] & 0x0f
+    ancount = (data[6] << 8) | data[7]
+    _log("T3", "rcv {}B from {} rcode={} ancount={}".format(
+        len(data), addr, rcode, ancount))
+    if rcode != 0:
+        _log("T3", "FAIL rcode != 0 (DNS error from upstream)")
+        return False
+    if ancount == 0:
+        _log("T3", "FAIL 0 answers in response")
+        return False
+    _log("T3", "PASS got valid DNS response")
+    return True
+
+
+def test_forward(pico_ip, peer_hint=None, wait_s=20):
+    # T4: full forwarder. Bind 53, recv, forward to 1.1.1.1, send answer back.
+    # uses select() on the upstream socket, same pattern as dns_monitor.
+    # run nslookup from a pc during this, or pass peer_hint to self-probe.
+    _log("T4", "starting forwarder on {}:53 for {}s".format(pico_ip, wait_s))
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("0.0.0.0", 53))
+        s.setblocking(False)
+        up = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        up.setblocking(False)
+    except Exception as e:
+        _log("T4", "FAIL bind: {}".format(e))
+        return
+
+    inflight = []  # [[txid, client_addr, sent_ms]]
+    deadline = _now_ms() + wait_s * 1000
+    queries = 0
+    answered = 0
+
+    while time.ticks_diff(deadline, _now_ms()) > 0:
+        now = _now_ms()
+
+        # Drain upstream responses.
+        if inflight:
+            r, _, _ = select.select([up], [], [], 0)
+            if r:
+                try:
+                    resp, _ = up.recvfrom(512)
+                except Exception:
+                    resp = None
+                if resp and len(resp) >= 2:
+                    rxid = (resp[0] << 8) | resp[1]
+                    for i, e in enumerate(inflight):
+                        if e[0] == rxid:
+                            s.sendto(resp, e[1])
+                            answered += 1
+                            _log("T4", "answered txid=0x{:04x} -> {}".format(
+                                rxid, e[1]))
+                            inflight.pop(i)
+                            break
+
+        # Drop stale inflight.
+        i = 0
+        while i < len(inflight):
+            if time.ticks_diff(now, inflight[i][2]) > 3000:
+                _log("T4", "drop stale txid=0x{:04x}".format(inflight[i][0]))
+                inflight.pop(i)
+            else:
+                i += 1
+
+        # Read new queries.
+        r, _, _ = select.select([s], [], [], 0)
+        if r:
+            try:
+                data, addr = s.recvfrom(512)
+            except Exception:
+                data = None
+            if data and len(data) >= 12:
+                queries += 1
+                txid = (data[0] << 8) | data[1]
+                if len(inflight) < 8:
+                    try:
+                        up.sendto(data, ("1.1.1.1", 53))
+                        inflight.append([txid, addr, _now_ms()])
+                        _log("T4", "fwd txid=0x{:04x} from {} (inflight={})".format(
+                            txid, addr, len(inflight)))
+                    except Exception as e:
+                        _log("T4", "upstream send FAIL: {}".format(e))
+                else:
+                    _log("T4", "drop query: inflight full")
+        time.sleep_ms(20)
+
+    s.close()
+    up.close()
+    _log("T4", "Done. Queries={} answered={}".format(queries, answered))
+    if queries == 0:
+        _log("T4", "FAIL: never received a query - check AP isolation / IP")
+    elif answered == 0:
+        _log("T4", "FAIL: got queries but never answered - upstream path broken")
+    else:
+        _log("T4", "PASS end-to-end")
+
+
+def run(my_ip):
+    # Run the full diagnostic. Pass the Pico's IP.
+    print("==== Heron DNS diagnostic ====")
+    print("Pico IP: {}".format(my_ip))
+    print()
+
+    # T1: can we even receive?
+    data, addr = test_listen(wait_s=8)
+    if data is None:
+        print()
+        print("T1 failed. Nothing else to do.")
+        print("Things to try:")
+        print("  - is the IP correct? nslookup from a PC should")
+        print("    reach the Pico on UDP/53")
+        print("  - check AP isolation on the router")
+        print("  - is another service already on UDP/53?")
+        return
+
+    # T2: echo a real nslookup
+    print()
+    print("T2: starting echo. From a PC on the same WiFi, run:")
+    print("    nslookup google.com {}".format(my_ip))
+    print("    you have 30s.")
+    test_echo(wait_s=30)
+
+    # T3: outbound DNS
+    print()
+    ok = test_upstream()
+
+    # T4: end-to-end (only useful if user runs nslookup during it)
+    print()
+    print("T4: starting forwarder. From a PC on the same WiFi, run:")
+    print("    nslookup cloudflare.com {}".format(my_ip))
+    print("    you have 20s.")
+    test_forward(my_ip, wait_s=20)
+
+    print()
+    print("==== done ====")
+import socket
+import select
+import time
+
+try:
+    import json
+except ImportError:
+    import ujson as json
+
+_MAX_REQUESTS = 150
+_DNSLOG_PATH = '/dnslog.json'
+_FLUSH_INTERVAL_S = 300  # 5 minutes
+_FLUSH_THRESHOLD = 50   # entries since last flush
+UPSTREAM_DNS = "1.1.1.1"
+UPSTREAM_PORT = 53
+FORWARD_TIMEOUT = 3
+_MAX_INFLIGHT = 8
+_INFLIGHT_TTL_MS = 3000
+
+# flagged domains: heron tracking/ad networks. match by suffix.
+# keep this under 50 entries for ram. pure domain strings, no wildcards.
+FLAGGED_DOMAINS = (
+    "doubleclick.net",
+    "googleadservices.com",
+    "googlesyndication.com",
+    "scorecardresearch.com",
+    "google-analytics.com",
+    "adservice.google.com",
+    "adsystem.amazon.com",
+    "analytics.apple.com",
+    "metrics.icloud.com",
+    "flurry.com",
+    "crashlytics.com",
+    "app-measurement.com",
+    "ads.yahoo.com",
+    "analytics.facebook.com",
+    "graph.facebook.com",
+    "connect.facebook.net",
+    "sc-static.net",
+    "criteo.com",
+    "criteo.net",
+    "advertising.com",
+    "quantserve.com",
+    "adsrvr.org",
+    "pubmatic.com",
+    "rubiconproject.com",
+    "openx.net",
+    "moatads.com",
+    "outbrain.com",
+    "taboola.com",
+    "disqus.com",
+    "branch.io",
+    "mixpanel.com",
+    "segment.io",
+    "amplitude.com",
+)
+
+# (ip, domain) pairs we've seen before. capped to avoid unbounded growth.
+_MAX_SEEN_PAIRS = 500
+
+# future heuristics not yet implemented:
+# - data-spike: requires byte counting, dns logger only sees queries not payloads
+# - night-activity: needs an rtc or ntp, pico has neither
+# - dns-hijack: needs to compare upstream responses against expected resolvers
+# - unknown-endpoint: needs ip resolution + allowlist comparison
+
+
+class DNSMonitor:
+    def __init__(self, device_tracker=None):
+        self.sock = None
+        self.dns_requests = []
+        self.device_tracker = device_tracker
+        self.last_error = None  # surfaced via /debug
+        # Upstream socket, one per instance. Non-blocking, polled in check_for_packets.
+        self.upstream = None
+        # In-flight: [txid, client_addr, sent_ms]. Capped at _MAX_INFLIGHT.
+        self._inflight = []
+        # seen (ip, domain) pairs for new-connection detection.
+        # dict key -> True. capped at _MAX_SEEN_PAIRS.
+        self._seen_pairs = {}
+        # persistence state
+        self._last_flush_s = time.time()
+        self._entries_since_flush = 0
+        self._boot_time = time.time()
+        self.load_persisted()
+
+    def _classify(self, source_ip, domain):
+        # returns (flagged: bool, kind: str, reason: str|None)
+        # priority: flagged-domain > new-connection > normal
+
+        # 1. flagged domain suffix match
+        d = domain.lower()
+        for pattern in FLAGGED_DOMAINS:
+            if d == pattern or d.endswith("." + pattern):
+                return (True, "flagged-domain", "matched: " + pattern)
+
+        # 2. new-connection: first contact from this ip to this domain
+        pair = source_ip + "|" + d
+        if pair not in self._seen_pairs:
+            self._seen_pairs[pair] = True
+            # cap: if over limit, drop oldest entries (dict preserves insertion order)
+            if len(self._seen_pairs) > _MAX_SEEN_PAIRS:
+                drop = _MAX_SEEN_PAIRS // 10
+                keys = list(self._seen_pairs.keys())
+                for k in keys[:drop]:
+                    del self._seen_pairs[k]
+            return (True, "new-connection", None)
+
+        # 3. normal: seen this pair before
+        return (False, "normal", None)
+
+    def start_server(self):
+        if self.sock:
+            self.stop_server()
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.bind(('0.0.0.0', 53))
+            self.sock.setblocking(False)
+            self.upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.upstream.setblocking(False)
+            print("DNS monitor started on port 53")
+            return True
+        except Exception as e:
+            self.last_error = "bind: {}".format(e)
+            print("DNS server failed: {}".format(e))
+            self._close_upstream()
+            if self.sock:
+                self.sock.close()
+                self.sock = None
+            return False
+
+    def stop_server(self):
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+        self._close_upstream()
+        self._inflight = []
+
+    def _close_upstream(self):
+        if self.upstream:
+            try:
+                self.upstream.close()
+            except Exception:
+                pass
+            self.upstream = None
+
+    def _drop_stale(self, now_ms):
+        # Drop anything older than _INFLIGHT_TTL_MS. Swap-pop, no alloc.
+        i = 0
+        n = len(self._inflight)
+        while i < n:
+            if time.ticks_diff(now_ms, self._inflight[i][2]) > _INFLIGHT_TTL_MS:
+                # swap-pop to remove without allocation
+                self._inflight[i] = self._inflight[n - 1]
+                self._inflight.pop()
+                n -= 1
+            else:
+                i += 1
+
+    def check_for_packets(self):
+        if not self.sock:
+            return None
+
+        now_ms = time.ticks_ms()
+
+        # 1. Drain upstream responses. Non-blocking.
+        if self.upstream is not None and self._inflight:
+            r, _, _ = select.select([self.upstream], [], [], 0)
+            if r:
+                try:
+                    resp, _ = self.upstream.recvfrom(512)
+                except Exception as e:
+                    self.last_error = "upstream recv: {}".format(e)
+                    print("Upstream recv error: {}".format(e))
+                    resp = None
+                if resp and len(resp) >= 2:
+                    rxid = (resp[0] << 8) | resp[1]
+                    # linear scan: _inflight is small (capped at _MAX_INFLIGHT)
+                    i = 0
+                    n = len(self._inflight)
+                    match = -1
+                    while i < n:
+                        if self._inflight[i][0] == rxid:
+                            match = i
+                            break
+                        i += 1
+                    if match >= 0:
+                        client_addr = self._inflight[match][1]
+                        # swap-pop the matched entry
+                        self._inflight[match] = self._inflight[n - 1]
+                        self._inflight.pop()
+                        try:
+                            self.sock.sendto(resp, client_addr)
+                        except Exception as e:
+                            self.last_error = "sendto client: {}".format(e)
+                            print("Sendto client error: {}".format(e))
+
+        # 2. Drop stale in-flight so a dead upstream response doesn't pin a slot.
+        self._drop_stale(now_ms)
+
+        # 3. Poll listen socket. Non-blocking, same as HTTP server.
+        ready = select.select([self.sock], [], [], 0)
+        if not ready[0]:
+            return None
+
+        try:
+            data, addr = self.sock.recvfrom(512)
+        except Exception as e:
+            self.last_error = "recvfrom: {}".format(e)
+            print("DNS recv error: {}".format(e))
+            return None
+
+        print("[dns] check_for_packets: {} bytes from {}".format(len(data), addr))
+        if len(data) < 12:
+            print("[dns] dropped: packet too short ({} bytes)".format(len(data)))
+            return None
+
+        domain = self._parse_domain(data)
+        if domain:
+            print("[dns] _parse_domain OK: {}".format(domain))
+        else:
+            print("[dns] _parse_domain FAILED for {}-byte packet".format(len(data)))
+
+        # Fire-and-forget forward. Never blocks. If upstream is busy or
+        # in-flight is full, we just log and move on.
+        self._forward_query(data, addr)
+
+        if domain:
+            flagged, kind, reason = self._classify(addr[0], domain)
+            entry = {
+                'source': addr[0],
+                'domain': domain,
+                'timestamp': time.time(),
+                'flagged': flagged,
+                'kind': kind,
+                'reason': reason,
+            }
+            self.dns_requests.append(entry)
+            print("[dns] appended entry, dns_requests len now {}".format(
+                len(self.dns_requests)))
+            if len(self.dns_requests) > _MAX_REQUESTS:
+                self.dns_requests = self.dns_requests[-_MAX_REQUESTS:]
+            if self.device_tracker:
+                self.device_tracker.record(
+                    entry['source'], entry['domain'], entry['timestamp'],
+                    flagged=flagged
+                )
+            self._entries_since_flush += 1
+            self._maybe_flush()
+            return entry
+
+        return None
+
+    def _forward_query(self, data, client_addr):
+        if self.upstream is None or len(data) < 2:
+            return
+        # Cap in-flight so a slow upstream doesn't grow the list unbounded.
+        if len(self._inflight) >= _MAX_INFLIGHT:
+            print("[dns] forward dropped: in-flight full ({})".format(_MAX_INFLIGHT))
+            return
+        txid = (data[0] << 8) | data[1]
+        try:
+            self.upstream.sendto(data, (UPSTREAM_DNS, UPSTREAM_PORT))
+        except Exception as e:
+            self.last_error = "upstream send: {}".format(e)
+            print("Upstream send error: {}".format(e))
+            return
+        # Append a small 3-tuple; no dict, no string formatting.
+        self._inflight.append([txid, client_addr, time.ticks_ms()])
+
+    def _parse_domain(self, data):
+        try:
+            offset = 12
+            parts = []
+            while offset < len(data) and data[offset] != 0:
+                length = data[offset]
+                if offset + length + 1 > len(data):
+                    break
+                parts.append(data[offset + 1:offset + 1 + length].decode('utf-8', 'ignore'))
+                offset += length + 1
+            return '.'.join(parts) if parts else None
+        except Exception as e:
+            self.last_error = "parse: {}".format(e)
+            return None
+
+    def get_recent_requests(self):
+        return self.dns_requests[-_MAX_REQUESTS:]
+
+    def get_boot_time(self):
+        return self._boot_time
+
+    # --- persistence -------------------------------------------------------
+
+    def load_persisted(self):
+        try:
+            with open(_DNSLOG_PATH, 'r') as f:
+                raw = f.read()
+            data = json.loads(raw)
+            if isinstance(data, list):
+                self.dns_requests = data[-_MAX_REQUESTS:]
+                print("[dns] loaded {} persisted entries".format(len(self.dns_requests)))
+        except OSError:
+            # file doesn't exist â€” first boot or wiped flash
+            pass
+        except Exception as e:
+            print("[dns] load_persisted error: {}".format(e))
+
+    def _maybe_flush(self):
+        now = time.time()
+        if self._entries_since_flush >= _FLUSH_THRESHOLD or \
+                (now - self._last_flush_s) >= _FLUSH_INTERVAL_S:
+            self._flush()
+
+    def maybe_flush(self):
+        self._maybe_flush()
+
+    def _flush(self):
+        try:
+            entries = self.dns_requests[-_MAX_REQUESTS:]
+            with open(_DNSLOG_PATH, 'w') as f:
+                json.dump(entries, f)
+            self._last_flush_s = time.time()
+            self._entries_since_flush = 0
+            print("[dns] flushed {} entries to flash".format(len(entries)))
+        except Exception as e:
+            print("[dns] flush failed: {}".format(e))
+            self.last_error = "flush: {}".format(e)
+# lib/ecdsa.py: minimal ECDSA P-256 sign for MicroPython (RP2350)
+#
+# Pure Python. No C extension. No mbedTLS. ~150 lines.
+# Designed for one-time use during provisioning: takes 2-5 seconds
+# on the RP2350, which is fine because the user is watching a spinner.
+#
+# Only implements sign(): verify happens in the browser via Web Crypto.
+# Uses the Pico's TRNG (machine.rng) for the per-signature k.
+# Outputs DER-encoded signatures that Web Crypto's SubtleCrypto.verify accepts.
+#
+# Curve: NIST P-256 (secp256r1)
+# Hash: SHA-256 (hardware-accelerated on RP2350 via hashlib)
+
+import hashlib
+import struct
+
+# --- P-256 curve parameters ---
+
+P = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff
+A = 0xffffffff00000001000000000000000000000000fffffffffffffffffffffffc
+B = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b
+N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
+GX = 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296
+GY = 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5
+G = (GX, GY)
+
+
+# --- Modular arithmetic ---
+
+def _inv_mod(a, m):
+    # Extended Euclidean GCD
+    if a < 0 or a >= m:
+        a = a % m
+    lm, hm = 1, 0
+    low, high = a, m
+    while low > 1:
+        r = high // low
+        nm = hm - lm * r
+        new = high - low * r
+        hm, high = lm, low
+        lm, low = nm, new
+    return lm % m
+
+
+def _point_add(p1, p2):
+    if p1 is None:
+        return p2
+    if p2 is None:
+        return p1
+    x1, y1 = p1
+    x2, y2 = p2
+    if x1 == x2:
+        if (y1 + y2) % P == 0:
+            return None
+        # point doubling
+        s = (3 * x1 * x1 + A) * _inv_mod(2 * y1, P) % P
+    else:
+        s = (y2 - y1) * _inv_mod(x2 - x1, P) % P
+    x3 = (s * s - x1 - x2) % P
+    y3 = (s * (x1 - x3) - y1) % P
+    return (x3, y3)
+
+
+def _scalar_mult(k, point):
+    # Double-and-add
+    result = None
+    addend = point
+    while k > 0:
+        if k & 1:
+            result = _point_add(result, addend)
+        addend = _point_add(addend, addend)
+        k >>= 1
+    return result
+
+
+# --- DER encoding ---
+
+def _int_to_der_bytes(n):
+    # Encode integer as DER INTEGER content (big-endian, minimal, leading
+    # zero if high bit set to keep it positive)
+    if n == 0:
+        return b'\x00'
+    b = b''
+    while n > 0:
+        b = bytes([n & 0xff]) + b
+        n >>= 8
+    if b[0] & 0x80:
+        b = b'\x00' + b
+    return b
+
+
+def _der_encode_sig(r, s):
+    # ASN.1 DER SEQUENCE { INTEGER r, INTEGER s }
+    r_bytes = _int_to_der_bytes(r)
+    s_bytes = _int_to_der_bytes(s)
+    r_tlv = bytes([0x02, len(r_bytes)]) + r_bytes
+    s_tlv = bytes([0x02, len(s_bytes)]) + s_bytes
+    seq_content = r_tlv + s_tlv
+    return bytes([0x30, len(seq_content)]) + seq_content
+
+
+# --- Random k from TRNG ---
+
+def _rand_int(bits):
+    # Generate a random integer from the Pico's TRNG.
+    # machine.rng() returns a 32-bit random number on the RP2 port.
+    try:
+        from machine import rng
+    except ImportError:
+        import os
+        # Fallback: os.urandom should work on RP2 as well
+        return int.from_bytes(os.urandom(bits // 8), 'big')
+    n_bytes = bits // 8
+    chunks = []
+    for _ in range(0, n_bytes, 4):
+        chunks.append(rng() & 0xffffffff)
+    raw = b''
+    for c in chunks:
+        raw += struct.pack('>I', c)
+    return int.from_bytes(raw[:n_bytes], 'big')
+
+
+# --- Public API ---
+
+def sign(private_key_int, message_bytes):
+    """Sign a message with ECDSA P-256.
+
+    Args:
+        private_key_int: 32-byte private key as an integer (0 < k < N)
+        message_bytes: the raw message to sign (will be SHA-256 hashed internally)
+
+    Returns:
+        DER-encoded signature bytes (typically 70-72 bytes)
+    """
+    # Hash the message
+    h = hashlib.sha256(message_bytes).digest()
+    z = int.from_bytes(h, 'big')
+
+    # Generate per-signature k from TRNG
+    while True:
+        k = _rand_int(256)
+        if 1 <= k < N:
+            break
+
+    # R = k * G
+    point = _scalar_mult(k, G)
+    r = point[0] % N
+    if r == 0:
+        # Astronomically unlikely, but handle it
+        return sign(private_key_int, message_bytes)
+
+    # s = k^(-1) * (z + r * private_key) mod N
+    k_inv = _inv_mod(k, N)
+    s = (k_inv * (z + r * private_key_int)) % N
+    if s == 0:
+        return sign(private_key_int, message_bytes)
+
+    # Low-S normalization (BIP-62 / RFC 6979 convention)
+    # Web Crypto accepts both high-S and low-S, but low-S is standard
+    if s > N // 2:
+        s = N - s
+
+    return _der_encode_sig(r, s)
+
+
+def public_key_bytes(private_key_int):
+    """Derive the public key (uncompressed point) from the private key.
+
+    Returns 65 bytes: 0x04 || X(32) || Y(32)
+    Used by the browser to verify the nonce signature.
+    """
+    point = _scalar_mult(private_key_int, G)
+    x = point[0].to_bytes(32, 'big')
+    y = point[1].to_bytes(32, 'big')
+    return b'\x04' + x + y# minimal non-blocking http server on port 8080.
+# raw sockets, no keep-alive, no threads: micropython safe.
+# poll() is called from the main loop, handles one connection per tick.
+#
+# API fields (audit/weekly entries):
+#   source: str        -- client ip
+#   domain: str        -- parsed dns domain
+#   timestamp: float   -- epoch seconds
+#   flagged: bool      -- true if a heuristic matched
+#   kind: str          -- "flagged-domain" | "new-connection" | "normal"
+#   reason: str|null   -- why it was flagged (e.g. "matched: doubleclick.net")
+#
+# API fields (stats):
+#   flagged_count: int -- sum of flagged entries across all devices
+import socket
+import select
+import time
+
+try:
+    import json
+except ImportError:  # pragma: no cover
+    import ujson as json
+
+_MAX_REQUEST_BYTES = 1024
+_DEFAULT_LIMIT = 50
+_MAX_LIMIT = 150
+
+_CORS_HEADERS = (
+    "Access-Control-Allow-Origin: *\r\n"
+    "Access-Control-Allow-Methods: GET, PUT, DELETE, OPTIONS\r\n"
+    "Access-Control-Allow-Headers: Content-Type\r\n"
+)
+
+_STATUS_TEXT = {
+    200: "OK",
+    201: "Created",
+    204: "No Content",
+    400: "Bad Request",
+    404: "Not Found",
+    405: "Method Not Allowed",
+    503: "Service Unavailable",
+}
+
+
+class HTTPServer:
+    def __init__(self, dns_monitor, device_tracker, port=8080, device_token=None, pico_mac=None):
+        self.dns_monitor = dns_monitor
+        self.device_tracker = device_tracker
+        self.port = port
+        self.sock = None
+        self.allowlist = []
+        self.device_token = device_token
+        # the pico's own mac (from wlan.config('mac')), formatted as
+        # "aa:bb:cc:dd:ee:ff" or None. exposed in /stats and /devices so
+        # the dashboard can run lookupVendor() on the heron device.
+        self.pico_mac = pico_mac
+
+    def start(self):
+        if self.sock:
+            self.stop()
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind(("0.0.0.0", self.port))
+            self.sock.listen(2)
+            self.sock.setblocking(False)
+            print("HTTP server started on port {}".format(self.port))
+            return True
+        except Exception as e:
+            print("HTTP server failed: {}".format(e))
+            self.sock = None
+            return False
+
+    def stop(self):
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+
+    def poll(self):
+        # Accept and serve one pending connection. Never blocks.
+        if not self.sock:
+            return
+
+        ready = select.select([self.sock], [], [], 0)
+        if not ready[0]:
+            return
+
+        try:
+            client, addr = self.sock.accept()
+        except OSError:
+            return
+
+        try:
+            client.setblocking(False)
+            self._handle_client(client)
+        except Exception as e:
+            print("HTTP handler error: {}".format(e))
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    # --- request handling -------------------------------------------------
+
+    def _read_request(self, client):
+        # read request data, retry briefly for non-blocking sockets
+        data = b""
+        start = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), start) < 250:
+            try:
+                chunk = client.recv(_MAX_REQUEST_BYTES - len(data))
+                if chunk:
+                    data += chunk
+                    # Complete HTTP request header section ends with \r\n\r\n
+                    if b"\r\n\r\n" in data:
+                        return data
+                elif data:
+                    # Empty chunk but we already have some data
+                    return data
+            except OSError:
+                pass
+            time.sleep_ms(5)
+        return data
+
+    def _handle_client(self, client):
+        raw = self._read_request(client)
+        if not raw:
+            self._send(client, 400, {"status": "error", "reason": "empty"})
+            return
+
+        # First line: METHOD PATH HTTP/x.y
+        line_end = raw.find(b"\r\n")
+        if line_end == -1:
+            line_end = len(raw)
+        first_line = raw[:line_end].decode("utf-8", "ignore")
+        parts = first_line.split(" ")
+        if len(parts) < 2:
+            self._send(client, 400, {"status": "error", "reason": "malformed"})
+            return
+
+        method = parts[0]
+        path = parts[1]
+
+        if method == "OPTIONS":
+            self._send(client, 204, None)
+            return
+
+        body = None
+        if method == "PUT":
+            sep = raw.find(b"\r\n\r\n")
+            if sep != -1:
+                body_bytes = raw[sep + 4:]
+                try:
+                    body = json.loads(body_bytes.decode("utf-8", "ignore"))
+                except (ValueError, OSError):
+                    body = None
+
+        self._route(client, method, path, body)
+
+    def _route(self, client, method, path, body):
+        # Strip query string for matching, keep it for parsing.
+        q = path.find("?")
+        if q != -1:
+            base = path[:q]
+            query = path[q + 1:]
+        else:
+            base = path
+            query = ""
+
+        if method == "GET" and base == "/health":
+            self._send(client, 200, {"status": "ok"})
+        elif method == "GET" and base == "/token":
+            # Expose the device token for future auth flows. Returns a
+            # truncated hint: the full token is only sent over the
+            # local network, never exposed publicly.
+            if self.device_token:
+                self._send(client, 200, {
+                    "status": "ok",
+                    "token_hint": self.device_token[:8]
+                })
+            else:
+                self._send(client, 404, {"status": "error", "reason": "no_token"})
+        elif method == "GET" and base == "/audit/weekly":
+            self._audit_weekly(client, query)
+        elif method == "GET" and base == "/devices":
+            # /devices is now a wrapper: {pico_mac, devices: [...]}.
+            # pico_mac is the heron device's own mac (None if
+            # wlan.config('mac') isn't available). the per-device `mac`
+            # field on each entry is best-effort and stays None on
+            # rp2350 stock firmware (no ARP API). dashboard adapters are
+            # updated to read the wrapped shape; the old bare-array
+            # shape is still parsed transparently for back-compat.
+            payload = {
+                "pico_mac": self.pico_mac,
+                "devices": self.device_tracker.get_all(),
+            }
+            self._safe_send(client, 200, payload)
+        elif method == "GET" and base == "/stats":
+            self._stats(client)
+        elif method == "GET" and base == "/debug":
+            self._debug(client)
+        elif method == "GET" and base == "/allowlist":
+            self._safe_send(client, 200, self.allowlist)
+        elif method == "PUT" and base == "/allowlist":
+            self._allowlist_add(client, body)
+        elif method == "DELETE" and base.startswith("/allowlist/"):
+            self._allowlist_delete(client, base[len("/allowlist/"):])
+        elif method == "PUT" and base.startswith("/devices/"):
+            self._device_rename(client, base[len("/devices/"):], body)
+        else:
+            self._send(client, 404, {"status": "error", "reason": "not found"})
+
+    # --- endpoint implementations ----------------------------------------
+
+    def _audit_weekly(self, client, query):
+        since = None
+        limit = _DEFAULT_LIMIT
+        for pair in query.split("&"):
+            if not pair:
+                continue
+            kv = pair.split("=", 1)
+            if len(kv) != 2:
+                continue
+            key, val = kv
+            if key == "since":
+                try:
+                    since = float(val)
+                except ValueError:
+                    since = None
+            elif key == "limit":
+                try:
+                    limit = int(val)
+                except ValueError:
+                    limit = _DEFAULT_LIMIT
+
+        if limit < 1:
+            limit = 1
+        elif limit > _MAX_LIMIT:
+            limit = _MAX_LIMIT
+
+        requests = self.dns_monitor.get_recent_requests()
+        entries = []
+        for r in requests:
+            if since is not None and r["timestamp"] < since:
+                continue
+            entries.append({
+                "source": r["source"],
+                "domain": r["domain"],
+                "timestamp": r["timestamp"],
+                "flagged": r.get("flagged", False),
+                "kind": r.get("kind", "normal"),
+                "reason": r.get("reason"),
+            })
+
+        # Cap to the most recent `limit` entries.
+        if len(entries) > limit:
+            entries = entries[-limit:]
+
+        self._safe_send(client, 200, entries)
+
+    def _stats(self, client):
+        stats = self.device_tracker.get_stats()
+        # unique_domains is cheaper to compute here from the request log.
+        domains = {}
+        for r in self.dns_monitor.dns_requests:
+            domains[r["domain"]] = True
+        stats["unique_domains"] = len(domains)
+        stats["boot_time"] = self.dns_monitor.get_boot_time()
+        # pico_mac: the heron device's own mac, for oui vendor lookup on
+        # the dashboard. None if wlan.config('mac') isn't available.
+        stats["pico_mac"] = self.pico_mac
+        self._safe_send(client, 200, stats)
+
+    def _debug(self, client):
+        # raw internal state for diagnosing empty-log problems
+        reqs = self.dns_monitor.dns_requests
+        devs = self.device_tracker.devices
+        payload = {
+            "dns_requests": {
+                "count": len(reqs),
+                "last_5": reqs[-5:],
+            },
+            "device_tracker": {
+                "device_count": len(devs),
+                "devices": list(devs.values()),
+            },
+            "dns_last_error": getattr(self.dns_monitor, "last_error", None),
+            "dns_sock_bound": self.dns_monitor.sock is not None,
+        }
+        self._safe_send(client, 200, payload)
+
+    def _allowlist_add(self, client, body):
+        if not isinstance(body, dict) or "pattern" not in body:
+            self._send(client, 400, {"status": "error", "reason": "pattern required"})
+            return
+        entry = {
+            "id": str(time.time_ns()),
+            "pattern": body["pattern"],
+            "created_at": int(time.time()),
+        }
+        self.allowlist.append(entry)
+        self._send(client, 201, {"status": "ok", "id": entry["id"]})
+
+    def _allowlist_delete(self, client, entry_id):
+        for i, entry in enumerate(self.allowlist):
+            if entry["id"] == entry_id:
+                del self.allowlist[i]
+                self._send(client, 200, {"status": "ok"})
+                return
+        self._send(client, 404, {"status": "error", "reason": "not found"})
+
+    def _device_rename(self, client, device_id, body):
+        from devices import MAX_NAME_LEN
+        if not isinstance(body, dict) or "name" not in body:
+            self._send(client, 400, {"status": "error", "reason": "name required"})
+            return
+        new_name = str(body["name"]).strip()
+        if not new_name:
+            self._send(client, 400, {"status": "error", "reason": "name empty"})
+            return
+        if len(new_name) > MAX_NAME_LEN:
+            self._send(client, 400, {"status": "error", "reason": "name too long"})
+            return
+        # Find device by id (hash) or IP
+        for ip, d in self.device_tracker.devices.items():
+            if d["id"] == device_id or d["ip"] == device_id:
+                if self.device_tracker.rename(ip, new_name):
+                    self._send(client, 200, {"status": "ok"})
+                    return
+                # length check already passed, so rename failed because the
+                # device isn't in the tracker (race with eviction, etc).
+                self._send(client, 404, {"status": "error", "reason": "device not found"})
+                return
+        self._send(client, 404, {"status": "error", "reason": "device not found"})
+
+    # --- response helpers -------------------------------------------------
+
+    def _safe_send(self, client, status, payload):
+        # serialize payload, degrade to 503 on MemoryError
+        try:
+            self._send(client, status, payload)
+        except MemoryError:
+            try:
+                self._send(client, 503, {"status": "error", "reason": "memory"})
+            except Exception:
+                pass
+
+    def _send(self, client, status, payload):
+        if payload is None:
+            body = b""
+        else:
+            body = json.dumps(payload).encode("utf-8")
+
+        reason = _STATUS_TEXT.get(status, "OK")
+        head = "HTTP/1.0 {} {}\r\n".format(status, reason)
+        head += "Content-Type: application/json\r\n"
+        head += _CORS_HEADERS
+        head += "Content-Length: {}\r\n".format(len(body))
+        head += "Connection: close\r\n\r\n"
+
+        self._send_all(client, head.encode("utf-8"))
+        if body:
+            self._send_all(client, body)
+
+    def _send_all(self, client, data):
+        view = memoryview(data)
+        sent = 0
+        total = len(data)
+        # retry on EAGAIN, bounded so a dead client cannot wedge the main loop
+        attempts = 0
+        while sent < total and attempts < 200:
+            try:
+                n = client.send(view[sent:])
+                if n:
+                    sent += n
+                else:
+                    attempts += 1
+            except OSError:
+                attempts += 1
+                time.sleep_ms(1)# persist device names to flash so they survive reboots.
+# separate file from config.json: renaming must not risk wifi creds.
+import json
+
+NAMES_PATH = "/names.json"
+
+
+def load_names():
+    # returns {ip: name} or {} if missing/corrupt
+    try:
+        with open(NAMES_PATH) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_names(names):
+    # write-then-verify: if the verify read fails, the old file is untouched.
+    try:
+        with open(NAMES_PATH, "w") as f:
+            json.dump(names, f)
+        # verify the write by reading back
+        with open(NAMES_PATH) as f:
+            json.load(f)
+        return True
+    except (OSError, ValueError):
+        return False# lib/otp_keys.py: device key storage for the RP2350
+#
+# key layout in storage (OTP or flash file):
+#   offset 0    32 bytes  ECDSA P-256 private key (raw, big-endian)
+#   offset 32   65 bytes  ECDSA P-256 public key (uncompressed, 0x04 || X || Y)
+#   offset 97    8 bytes  device serial number
+#   offset 105 148 bytes  device certificate (DER, null-padded)
+#   offset 253   1 byte   magic (0x01 = keys present)
+#   total device keys: 254 bytes
+#
+# update key layout (extends the device key region):
+#   offset 254  65 bytes  firmware update public key (uncompressed, 0x04 || X || Y)
+#   offset 319  32 bytes  SHA-256 of update public key (integrity check)
+#   offset 351   1 byte   update-key magic (0x01 = present)
+#   offset 352   1 byte   active key slot index (0..3, for rotation)
+#   offset 353 192 bytes  reserved (4 x 48 bytes for future key-hash slots)
+#   total update keys: 291 bytes (254..545)
+#   total storage: 545 bytes
+#
+# backend selection: at import time, try machine.OTP. if the RP2350 OTP
+# API is not available in the running MicroPython build, fall back to a
+# flash file at /keys.bin. the file is written once during manufacturing
+# and read-only during normal operation.
+#
+# burn_keys is atomic-by-construction: data fields are written first,
+# the magic byte is written LAST. read-back verification happens between
+# the data and magic writes -- if any byte does not match what we wrote,
+# the magic byte is never set and burn_keys returns False. the device
+# can be re-attempted (OTP bits only go 0->1, so retrying a partial
+# write is safe).
+#
+# burn_update_key follows the same atomic pattern: the public key and
+# hash are written and verified first, then the magic byte is written
+# LAST. the active slot byte is written alongside the data fields (it
+# is not a commit signal -- the magic byte is).
+import sys
+
+# --- layout constants. the on-device byte positions of every field.
+# these are part of the contract -- if they move, every burned device
+# is bricked. the test suite locks them.
+_PRIVATE_KEY_OFFSET = 0
+_PRIVATE_KEY_LEN = 32
+_PUBLIC_KEY_OFFSET = 32
+_PUBLIC_KEY_LEN = 65
+_SERIAL_OFFSET = 97
+_SERIAL_LEN = 8
+_CERT_OFFSET = 105
+_CERT_LEN = 148
+_MAGIC_OFFSET = 253
+_MAGIC_VALUE = 0x01
+
+# flash fallback path
+_KEY_FILE = "/keys.bin"
+
+
+# --- backend selection. runs once at import. ---
+
+def _init_backend():
+    # three backends, in priority order:
+    #   1. RP2350 OTP via machine.OTP (production, on-device)
+    #   2. flash file at /keys.bin (on-device fallback if OTP unavailable)
+    #   3. in-memory dict (cpython test environment, host-only)
+    try:
+        import machine
+        otp_cls = getattr(machine, "OTP", None)
+        if otp_cls is not None:
+            return "otp", otp_cls()
+    except Exception:
+        pass
+    # on cpython we cannot write to /keys.bin (root-owned path, no
+    # MicroPython FS). the in-memory backend keeps tests runnable.
+    is_micropython = "MicroPython" in sys.version or hasattr(sys, "implementation") and getattr(sys.implementation, "name", "") == "micropython"
+    if is_micropython:
+        return "flash", None
+    return "memory", {}
+
+
+_BACKEND, _OTP = _init_backend()
+
+
+# --- low-level read/write. swappable per backend. ---
+
+def _read_bytes(offset, length):
+    if _BACKEND == "otp":
+        try:
+            return bytes(_OTP.read(offset, length))
+        except Exception as e:
+            print("[otp_keys] OTP read failed at", offset, ":", e)
+            return None
+    if _BACKEND == "flash":
+        try:
+            with open(_KEY_FILE, "rb") as f:
+                f.seek(offset)
+                return f.read(length)
+        except (OSError, ValueError):
+            return None
+    # in-memory backend. dict keyed by (offset, length) tuples.
+    return _OTP.get((offset, length))
+
+
+def _write_bytes(offset, data):
+    if _BACKEND == "otp":
+        # OTP is one-time-write. bits go 0->1 only. writes to already-1
+        # bits are no-ops on the hardware -- the verify-back step will
+        # catch any bit that failed to set.
+        try:
+            _OTP.write(offset, data)
+        except Exception as e:
+            raise OSError("OTP write failed at {}: {}".format(offset, e))
+        return
+    if _BACKEND == "flash":
+        # read-modify-write across the whole file. during manufacturing
+        # the file is built up across multiple _write_bytes calls.
+        try:
+            with open(_KEY_FILE, "rb") as f:
+                existing = bytearray(f.read())
+        except OSError:
+            existing = bytearray()
+        needed = offset + len(data)
+        if len(existing) < needed:
+            existing.extend(b'\x00' * (needed - len(existing)))
+        existing[offset:offset + len(data)] = data
+        with open(_KEY_FILE, "wb") as f:
+            f.write(bytes(existing))
+        return
+    # in-memory backend
+    _OTP[(offset, len(data))] = bytes(data)
+
+
+def _verify_region(offset, length, expected):
+    # read back a region and compare. returns True if every byte matches.
+    actual = _read_bytes(offset, length)
+    if actual is None or len(actual) != length:
+        return False
+    return actual == expected
+
+
+# --- public read API ---
+
+def has_keys():
+    magic = _read_bytes(_MAGIC_OFFSET, 1)
+    if magic is None or len(magic) != 1:
+        return False
+    return magic[0] == _MAGIC_VALUE
+
+
+def get_private_key():
+    try:
+        return _read_bytes(_PRIVATE_KEY_OFFSET, _PRIVATE_KEY_LEN)
+    except Exception as e:
+        print("[otp_keys] get_private_key failed:", e)
+        return None
+
+
+def get_public_key():
+    try:
+        return _read_bytes(_PUBLIC_KEY_OFFSET, _PUBLIC_KEY_LEN)
+    except Exception as e:
+        print("[otp_keys] get_public_key failed:", e)
+        return None
+
+
+def get_serial():
+    try:
+        raw = _read_bytes(_SERIAL_OFFSET, _SERIAL_LEN)
+    except Exception as e:
+        print("[otp_keys] get_serial failed:", e)
+        return None
+    if raw and len(raw) == _SERIAL_LEN:
+        return raw.hex()
+    return None
+
+
+def get_certificate():
+    try:
+        cert = _read_bytes(_CERT_OFFSET, _CERT_LEN)
+    except Exception as e:
+        print("[otp_keys] get_certificate failed:", e)
+        return None
+    if cert and len(cert) == _CERT_LEN:
+        cert = cert.rstrip(b'\x00')
+        if len(cert) > 0:
+            return cert
+    return None
+
+
+def get_private_key_int():
+    raw = get_private_key()
+    if raw and len(raw) == _PRIVATE_KEY_LEN:
+        return int.from_bytes(raw, 'big')
+    return None
+
+
+# --- public write API: burn_keys ---
+
+def burn_keys(private_key, public_key, serial, certificate):
+    # 1. validate input lengths. wrong sizes cannot be tolerated --
+    #    writing 31 bytes where 32 were expected leaves an OTP cell
+    #    that will be read as something else.
+    if not isinstance(private_key, (bytes, bytearray)) or len(private_key) != _PRIVATE_KEY_LEN:
+        print("[otp_keys] burn: private key must be {} bytes, got {}".format(
+            _PRIVATE_KEY_LEN, len(private_key) if hasattr(private_key, '__len__') else '?'))
+        return False
+    if not isinstance(public_key, (bytes, bytearray)) or len(public_key) != _PUBLIC_KEY_LEN:
+        print("[otp_keys] burn: public key must be {} bytes".format(_PUBLIC_KEY_LEN))
+        return False
+    if not isinstance(serial, (bytes, bytearray)) or len(serial) != _SERIAL_LEN:
+        print("[otp_keys] burn: serial must be {} bytes".format(_SERIAL_LEN))
+        return False
+    if not isinstance(certificate, (bytes, bytearray)) or len(certificate) > _CERT_LEN:
+        print("[otp_keys] burn: cert must be <= {} bytes".format(_CERT_LEN))
+        return False
+
+    # 2. write each data field. the magic byte is intentionally LAST --
+    #    a set magic byte is the commit signal. before that, the device
+    #    appears unprovisioned.
+    try:
+        _write_bytes(_PRIVATE_KEY_OFFSET, bytes(private_key))
+        _write_bytes(_PUBLIC_KEY_OFFSET, bytes(public_key))
+        _write_bytes(_SERIAL_OFFSET, bytes(serial))
+        # pad cert to fixed length. the actual DER cert is variable
+        # (sig + serial + pubKey, ~146 bytes max). nulls are trimmed on read.
+        cert_padded = bytes(certificate) + b'\x00' * (_CERT_LEN - len(certificate))
+        _write_bytes(_CERT_OFFSET, cert_padded)
+    except OSError as e:
+        print("[otp_keys] burn: write failed:", e)
+        return False
+
+    # 3. read-back verify. every data field must match exactly. if any
+    #    byte mismatches, the device is partially burned but the magic
+    #    byte has not been set, so the device is still recoverable: it
+    #    will be read as "no keys" by has_keys(), and the burn can be
+    #    retried (OTP bits only go 0->1, so retrying a partial write is
+    #    safe -- it just sets the same bits again).
+    if not _verify_region(_PRIVATE_KEY_OFFSET, _PRIVATE_KEY_LEN, bytes(private_key)):
+        print("[otp_keys] burn: verify failed (private key)")
+        return False
+    if not _verify_region(_PUBLIC_KEY_OFFSET, _PUBLIC_KEY_LEN, bytes(public_key)):
+        print("[otp_keys] burn: verify failed (public key)")
+        return False
+    if not _verify_region(_SERIAL_OFFSET, _SERIAL_LEN, bytes(serial)):
+        print("[otp_keys] burn: verify failed (serial)")
+        return False
+    if not _verify_region(_CERT_OFFSET, _CERT_LEN, cert_padded):
+        print("[otp_keys] burn: verify failed (certificate)")
+        return False
+
+    # 4. commit: write the magic byte. this is the point of no return.
+    try:
+        _write_bytes(_MAGIC_OFFSET, bytes([_MAGIC_VALUE]))
+    except OSError as e:
+        print("[otp_keys] burn: magic write failed:", e)
+        return False
+
+    return True
+# usb webserial provisioning: line-delimited json over usb cdc (115200 baud).
+# see the onboarding pwa for the host side.
+import sys
+import json
+import time
+
+CONFIG_PATH = "/config.json"
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(data):
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(data, f)
+
+
+def _rand_hex(n=32):
+    # Random hex string using machine.rng(): available on RP2 port.
+    # Falls back to ubinascii if rng is missing (should not happen on Pico 2 W).
+    try:
+        from machine import rng
+        return "".join("{:02x}".format(rng()) for _ in range(n // 2 + 1))[:n]
+    except Exception:
+        import ubinascii
+        import os
+        return ubinascii.hexlify(os.urandom(n // 2)).decode()[:n]
+
+
+def ensure_device_token():
+    """Generate and persist a random device token if one does not exist yet.
+    Called once on first boot. The token is stored in config.json and can
+    later be used for API authentication without a firmware reflash."""
+    cfg = load_config()
+    if cfg.get("device_token"):
+        return cfg["device_token"]
+    token = _rand_hex(32)
+    cfg["device_token"] = token
+    try:
+        save_config(cfg)
+        print("Device token generated:", token[:8] + "...")
+    except OSError as e:
+        print("Failed to save device token:", e)
+        return None
+    return token
+
+
+def is_provisioned():
+    cfg = load_config()
+    return bool(cfg.get("ssid")) and "pass" in cfg
+
+
+def _send(obj):
+    print(json.dumps(obj))
+
+
+def _clean_line(line):
+    if not line:
+        return ""
+    line = line.strip("\r\n\x00")
+    if line and line[0] == "\ufeff":
+        line = line[1:]
+    return line.strip()
+
+
+def _handle(line):
+    line = _clean_line(line)
+    if not line:
+        return False
+    if line[0] != "{":
+        return False
+
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        _send({"status": "error", "reason": "bad_json"})
+        return False
+
+    cmd = msg.get("cmd")
+
+    if cmd == "identify":
+        # Return device identity from OTP/key storage.
+        # No sticker code: the device proves itself via challenge-response.
+        try:
+            import otp_keys
+            serial = otp_keys.get_serial()
+            has_keys = otp_keys.has_keys()
+        except Exception:
+            serial = None
+            has_keys = False
+        _send({
+            "status": "ok",
+            "serial": serial,
+            "has_keys": has_keys,
+        })
+        return False
+
+    if cmd == "challenge":
+        # Challenge-response authentication.
+        # PWA sends a random nonce, device signs it with its private key.
+        # PWA verifies the signature against the device public key
+        # (extracted from the device certificate, which is signed by
+        # the Northsline root key embedded in the PWA).
+        nonce_hex = msg.get("nonce")
+        if not nonce_hex or not isinstance(nonce_hex, str):
+            _send({"status": "error", "reason": "missing_nonce"})
+            return False
+
+        try:
+            nonce_bytes = bytes.fromhex(nonce_hex)
+        except ValueError:
+            _send({"status": "error", "reason": "bad_nonce"})
+            return False
+
+        if len(nonce_bytes) != 32:
+            _send({"status": "error", "reason": "bad_nonce_length"})
+            return False
+
+        try:
+            import otp_keys
+            import ecdsa
+            import ubinascii
+
+            priv_int = otp_keys.get_private_key_int()
+            if priv_int is None:
+                _send({"status": "error", "reason": "no_keys"})
+                return False
+
+            serial = otp_keys.get_serial()
+            cert = otp_keys.get_certificate()
+            if cert is None:
+                _send({"status": "error", "reason": "no_cert"})
+                return False
+
+            # Sign the nonce (ecdsa.sign hashes internally with SHA-256)
+            sig_der = ecdsa.sign(priv_int, nonce_bytes)
+            _send({
+                "status": "ok",
+                "serial": serial,
+                "cert": ubinascii.hexlify(cert).decode(),
+                "signature": ubinascii.hexlify(sig_der).decode(),
+            })
+        except Exception as e:
+            _send({"status": "error", "reason": "sign_failed:%s" % e})
+        return False
+
+    if cmd == "scan":
+        # Return available WiFi networks as JSON so the PWA can show
+        # a dropdown instead of asking the user to type the SSID.
+        try:
+            import network
+            wlan = network.WLAN(network.STA_IF)
+            wlan.active(True)
+            nets = wlan.scan()
+            # Each result: (ssid, bssid, channel, rssi, authmode, hidden)
+            # Cap at 15 to keep the payload small.
+            out = []
+            for n in nets[:15]:
+                try:
+                    ssid = n[0].decode("utf-8", "ignore") if n[0] else ""
+                except Exception:
+                    ssid = ""
+                bssid = ":".join("{:02x}".format(b) for b in n[1]) if n[1] else ""
+                out.append({
+                    "ssid": ssid,
+                    "bssid": bssid,
+                    "channel": n[2] if len(n) > 2 else 0,
+                    "rssi": n[3] if len(n) > 3 else 0,
+                    "hidden": bool(n[5]) if len(n) > 5 else False,
+                })
+            _send({"status": "ok", "networks": out})
+        except Exception as e:
+            _send({"status": "error", "reason": "scan_failed:%s" % e})
+        return False
+
+    if cmd == "router_info":
+        # Return the connected AP's BSSID and the Pico's IP address.
+        # Called by the PWA after provisioning to identify the router
+        # vendor (OUI lookup on BSSID prefix) and show router-specific
+        # setup instructions.
+        try:
+            import network
+            wlan = network.WLAN(network.STA_IF)
+            if not wlan.isconnected():
+                # Freshly provisioned devices have not rebooted yet. Try to
+                # connect using the saved config so the PWA can read the
+                # AP's BSSID while still on USB.
+                cfg = load_config()
+                ssid = cfg.get("ssid")
+                pwd = cfg.get("pass")
+                if ssid and pwd is not None:
+                    wlan.active(True)
+                    wlan.connect(ssid, pwd)
+                    start = time.time()
+                    while not wlan.isconnected() and (time.time() - start) < 15:
+                        time.sleep(0.5)
+            if not wlan.isconnected():
+                _send({"status": "error", "reason": "not_connected"})
+                return False
+            bssid = ":".join("{:02x}".format(b) for b in wlan.config("bssid"))
+            ip = wlan.ifconfig()[0]
+            _send({"status": "ok", "bssid": bssid, "ip": ip})
+        except Exception as e:
+            _send({"status": "error", "reason": "router_info_failed:%s" % e})
+        return False
+
+    if cmd == "provision":
+        ssid = msg.get("ssid")
+        password = msg.get("pass")
+
+        if not ssid or password is None:
+            _send({"status": "error", "reason": "missing_wifi"})
+            return False
+
+        cfg = load_config()
+        cfg["ssid"] = ssid
+        cfg["pass"] = password
+        try:
+            save_config(cfg)
+        except OSError as e:
+            _send({"status": "error", "reason": "write_failed:%s" % e})
+            return False
+
+        _send({"status": "ok"})
+        return True
+
+    _send({"status": "error", "reason": "unknown_cmd"})
+    return False
+
+
+# Global poller used by bulk reader. Initialised lazily so import is cheap.
+_poll = None
+
+
+def _init_poll():
+    global _poll
+    if _poll is not None:
+        return
+    try:
+        import uselect
+
+        _poll = uselect.poll()
+        _poll.register(sys.stdin, uselect.POLLIN)
+    except Exception:
+        _poll = None
+
+
+def _read_available():
+    """Read as many bytes as currently available from stdin without blocking.
+    Some MicroPython USB-CDC stacks deliver data one byte at a time; batching
+    improves reliability and prevents dropped characters between beacons.
+    """
+    _init_poll()
+    data = ""
+    try:
+        while True:
+            if _poll is not None:
+                if not _poll.poll(0):
+                    break
+            ch = sys.stdin.read(1)
+            if not ch:
+                break
+            data += ch
+    except Exception:
+        pass
+    return data
+
+
+def enter_provisioning_mode():
+    print("Entering provisioning mode. Waiting for USB setup...")
+    _send({"status": "ready"})
+
+    buf = ""
+    last_ready = time.ticks_ms()
+
+    while True:
+        now = time.ticks_ms()
+        if time.ticks_diff(now, last_ready) > 2000:
+            _send({"status": "ready"})
+            last_ready = now
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+        data = _read_available()
+        if data:
+            for ch in data:
+                if ch in ("\n", "\r"):
+                    if buf:
+                        if _handle(buf):
+                            print("Provisioning complete.")
+                            return
+                        buf = ""
+                    continue
+                buf += ch
+        else:
+            time.sleep_ms(10)
+
+    # Unreachable.
+    _send({"status": "error", "reason": "provisioning_loop_exit"})
+# ssd1306.py
+from micropython import const
+import framebuf
+
+SET_CONTRAST = const(0x81)
+SET_ENTIRE_ON = const(0xA4)
+SET_NORM_INV = const(0xA6)
+SET_DISP = const(0xAE)
+SET_MEM_ADDR = const(0x20)
+SET_COL_ADDR = const(0x21)
+SET_PAGE_ADDR = const(0x22)
+SET_DISP_START_LINE = const(0x40)
+SET_SEG_REMAP = const(0xA0)
+SET_MUX_RATIO = const(0xA8)
+SET_COM_OUT_DIR = const(0xC0)
+SET_DISP_OFFSET = const(0xD3)
+SET_COM_PIN_CFG = const(0xDA)
+SET_DISP_CLK_DIV = const(0xD5)
+SET_PRECHARGE = const(0xD9)
+SET_VCOM_DESEL = const(0xDB)
+SET_CHARGE_PUMP = const(0x8D)
+
+class SSD1306(framebuf.FrameBuffer):
+    def __init__(self, width, height, external_vcc):
+        self.width = width
+        self.height = height
+        self.external_vcc = external_vcc
+        self.pages = self.height // 8
+        self.buffer = bytearray(self.pages * self.width)
+        super().__init__(self.buffer, self.width, self.height, framebuf.MONO_VLSB)
+        self.init_display()
+
+    def init_display(self):
+        for cmd in (
+            SET_DISP | 0x00, SET_MEM_ADDR, 0x00, SET_DISP_START_LINE | 0x00, SET_SEG_REMAP | 0x01,
+            SET_MUX_RATIO, self.height - 1, SET_COM_OUT_DIR | 0x08, SET_DISP_OFFSET, 0x00,
+            SET_COM_PIN_CFG, 0x12 if self.width == 128 and self.height == 64 else 0x02,
+            SET_CONTRAST, 0xCF, SET_PRECHARGE, 0xF1, SET_VCOM_DESEL, 0x40, SET_ENTIRE_ON,
+            SET_NORM_INV, SET_DISP_CLK_DIV, 0x80, SET_CHARGE_PUMP, 0x14, SET_DISP | 0x01
+        ): self.write_cmd(cmd)
+        self.fill(0)
+        self.show()
+
+    def poweroff(self): self.write_cmd(SET_DISP | 0x00)
+    def poweron(self): self.write_cmd(SET_DISP | 0x01)
+    def contrast(self, contrast): self.write_cmd(SET_CONTRAST); self.write_cmd(contrast)
+    def invert(self, invert): self.write_cmd(SET_NORM_INV | (invert & 1))
+    def show(self):
+        x0 = 0
+        x1 = self.width - 1
+        if self.width == 64: x0 += 32; x1 += 32
+        self.write_cmd(SET_COL_ADDR); self.write_cmd(x0); self.write_cmd(x1)
+        self.write_cmd(SET_PAGE_ADDR); self.write_cmd(0); self.write_cmd(self.pages - 1)
+        self.write_data(self.buffer)
+
+class SSD1306_I2C(SSD1306):
+    def __init__(self, width, height, i2c, addr=0x3C, external_vcc=False):
+        self.i2c = i2c
+        self.addr = addr
+        self.temp = bytearray(2)
+        self.write_list = [b"\x40", None]
+        super().__init__(width, height, external_vcc)
+
+    def write_cmd(self, cmd):
+        self.temp[0] = 0x00
+        self.temp[1] = cmd
+        self.i2c.writeto(self.addr, self.temp)
+
+    def write_data(self, buf):
+        self.write_list[1] = buf
+        self.i2c.writevto(self.addr, self.write_list)
+# pico ups b driver: ina219 current/power monitor at i2c addr 0x43.
+# the ups sits on i2c bus 0 (gp6 sda / gp7 scl), separate from the oled
+# which is on i2c bus 1 (gp2 sda / gp3 scl).
+#
+# waveshare pico ups b uses an ina219 with a 0.1 ohm shunt resistor.
+# the onboard eta6003 handles charging and power path management; we
+# only read the ina219 for voltage, current, and estimated charge level.
+#
+# register layout from the ina219 datasheet and waveshare demo code.
+# calibration: 32v bus range, gain 8 (320mv shunt), 12-bit 32-sample avg.
+
+import time
+
+try:
+    from machine import I2C, Pin
+except ImportError:
+    # cpython test fallback: no real i2c
+    I2C = None
+    Pin = None
+
+# i2c bus: 0 (gp6/gp7). oled is on bus 1 (gp2/gp3). they are independent.
+UPS_I2C_BUS = 0
+UPS_I2C_ADDR = 0x43
+
+# ina219 registers
+_REG_CONFIG = 0x00
+_REG_SHUNTVOLTAGE = 0x01
+_REG_BUSVOLTAGE = 0x02
+_REG_POWER = 0x03
+_REG_CURRENT = 0x04
+_REG_CALIBRATION = 0x05
+
+# calibration constants (32v, 2a range, 0.1 ohm shunt)
+_CAL_VALUE = 4096
+_CURRENT_LSB_MA = 100  # 100 uA per bit = 0.1 ma per bit
+_POWER_LSB_MW = 2     # 2 mW per bit
+
+# config word: 32v range | gain 8 (320mv) | 12-bit 32-sample bus+shunt | continuous
+_CONFIG_WORD = (0x01 << 13) | (0x03 << 11) | (0x0D << 7) | (0x0D << 3) | 0x07
+
+# li-po voltage range for percent estimate. the waveshare demo uses
+# (bus_voltage - 3.0) / 1.2 * 100, clamped 0..100. that maps 3.0v=0%, 4.2v=100%
+# which is the standard 1s li-po discharge curve. good enough for a status
+# indicator -- not a fuel gauge.
+_BATT_MIN_V = 3.0
+_BATT_MAX_V = 4.2
+
+
+class UPS:
+    # reads the ina219 on the pico ups b. all reads are best-effort: if i2c
+    # fails the last heron values are kept and available() returns false.
+
+    def __init__(self, i2c=None):
+        self.i2c = i2c
+        self._available = False
+        self._bus_v = 0.0
+        self._current_ma = 0.0
+        self._power_mw = 0.0
+        self._shunt_mv = 0.0
+        self._last_read_ms = 0
+
+        if i2c is None and I2C is not None:
+            try:
+                self.i2c = I2C(UPS_I2C_BUS, scl=Pin(7), sda=Pin(6), freq=400000)
+            except Exception as e:
+                print("UPS I2C init failed:", e)
+                self.i2c = None
+
+        if self.i2c is not None:
+            self._configure()
+
+    def _configure(self):
+        try:
+            self._write_reg(_REG_CALIBRATION, _CAL_VALUE)
+            self._write_reg(_REG_CONFIG, _CONFIG_WORD)
+            # re-write cal after config: some ina219 clones reset cal when
+            # config changes. belt and suspenders.
+            self._write_reg(_REG_CALIBRATION, _CAL_VALUE)
+            self._available = True
+            print("UPS INA219 configured at 0x%02x" % UPS_I2C_ADDR)
+        except Exception as e:
+            print("UPS INA219 config failed:", e)
+            self._available = False
+
+    def _read_reg(self, reg):
+        data = self.i2c.readfrom_mem(UPS_I2C_ADDR, reg, 2)
+        return (data[0] << 8) | data[1]
+
+    def _write_reg(self, reg, value):
+        hi = (value >> 8) & 0xFF
+        lo = value & 0xFF
+        self.i2c.writeto_mem(UPS_I2C_ADDR, reg, bytes([hi, lo]))
+
+    @staticmethod
+    def _to_signed(raw):
+        if raw > 32767:
+            raw -= 65536
+        return raw
+
+    def read(self):
+        # read all registers in one pass. returns true on success.
+        if not self.i2c:
+            return False
+        try:
+            # re-write cal before reading current/power: sharp loads can
+            # reset the ina219 cal register, making those reads garbage.
+            self._write_reg(_REG_CALIBRATION, _CAL_VALUE)
+
+            raw_shunt = self._read_reg(_REG_SHUNTVOLTAGE)
+            raw_bus = self._read_reg(_REG_BUSVOLTAGE)
+            raw_current = self._read_reg(_REG_CURRENT)
+            raw_power = self._read_reg(_REG_POWER)
+
+            self._shunt_mv = self._to_signed(raw_shunt) * 0.01
+            # bus voltage register: bits [15:3] are the value, then *4 mv
+            self._bus_v = ((raw_bus >> 3) * 4) * 0.001
+            self._current_ma = self._to_signed(raw_current) * (_CURRENT_LSB_MA / 1000.0)
+            self._power_mw = self._to_signed(raw_power) * _POWER_LSB_MW
+
+            self._last_read_ms = time.ticks_ms() if hasattr(time, 'ticks_ms') else 0
+            self._available = True
+            return True
+        except Exception as e:
+            print("UPS read failed:", e)
+            self._available = False
+            return False
+
+    @property
+    def available(self):
+        return self._available
+
+    @property
+    def bus_voltage(self):
+        return self._bus_v
+
+    @property
+    def current_ma(self):
+        return self._current_ma
+
+    @property
+    def power_mw(self):
+        return self._power_mw
+
+    @property
+    def shunt_mv(self):
+        return self._shunt_mv
+
+    @property
+    def battery_percent(self):
+        # linear map from li-po voltage range. not precise, but good
+        # enough for "is the battery healthy" status. clamped 0..100.
+        pct = (self._bus_v - _BATT_MIN_V) / (_BATT_MAX_V - _BATT_MIN_V) * 100
+        if pct < 0:
+            return 0
+        if pct > 100:
+            return 100
+        return int(pct)
+
+    @property
+    def on_battery(self):
+        # if bus voltage is below ~3.3v and current is near zero or
+        # negative, we are likely running on battery with no usb input.
+        # this is a heuristic: the eta6003 passes bus voltage through when
+        # usb is connected. without usb, the battery drives vsys directly.
+        return self._bus_v < 3.3 and self._available
+
+    def get_status(self):
+        # returns a dict for the http /power endpoint and oled display.
+        return {
+            "available": self._available,
+            "bus_voltage": round(self._bus_v, 3),
+            "current_ma": round(self._current_ma, 2),
+            "power_mw": round(self._power_mw, 2),
+            "battery_percent": self.battery_percent,
+            "on_battery": self.on_battery,
+        }# Heron firmware: pico 2 w dns monitor
+# listens on udp/53, logs queries, forwards to upstream.
+# oled shows query count, wifi status, uptime.
+import machine
+import time
+
+OLED_SCL_PIN = 3
+OLED_SDA_PIN = 2
+BUZZER_PIN = 15
+
+OLED_MAX_CHARS = 16
+WIFI_TIMEOUT_S = 30
+MDNS_HOSTNAME = "heron"
+
+# OLED timing. All in ms; use ticks_ms/ticks_diff everywhere.
+OLED_CYCLE_MS = 3000            # how long each phase shows during normal operation
+OLED_CYCLE_PROVISIONING_MS = 800  # fast cycle for the pre-serial intro
+# The provisioning intro must finish inside the PWA's ~15 s ready-beacon
+# window after a port-open reboot. Keep it short so enter_provisioning_mode()
+# can send {"status": "ready"} in time.
+HEARTBEAT_MS = 1000        # corner dot blink period
+WIFI_LOST_PULSE_MS = 250   # half-period of WiFi-lost flash
+RESTART_SPINNER_MS = 150   # spinner frame duration
+
+# Spinner glyphs for the "Restarting..." screen. Module-level so the
+# string objects are allocated once at import time, not per frame.
+_SPINNER = ['|', '/', '-', '\\']
+
+# Heartbeat dot pixel coords (top-right corner, just inside the bezel).
+_HEARTBEAT_X = 122
+_HEARTBEAT_Y = 2
+
+
+def _show_provisioning_oled():
+    # cycle onboarding hints so the user knows the device is alive.
+    # runs one full rotation then returns: provisioning takes over after.
+    try:
+        from machine import Pin, I2C
+        import ssd1306
+
+        i2c = I2C(1, scl=Pin(OLED_SCL_PIN), sda=Pin(OLED_SDA_PIN), freq=400000)
+        if 0x3C not in i2c.scan():
+            print("OLED not detected on I2C bus")
+            return
+        oled = ssd1306.SSD1306_I2C(128, 64, i2c, addr=0x3C)
+
+        # Four screens, one full rotation. Phases are tuples of
+        # (line1, line2, line3): short strings, no allocation per frame.
+        phases = [
+            ("Heron",  "Plug into PC",   "Open heron.local"),
+            ("Heron",  "Setting up...",  " "),
+            ("Heron",  "Ready",          " "),
+            ("Heron",  "Waiting for you", " "),
+        ]
+        # Pre-slice to the OLED width so we do not truncate on every call.
+        for i in range(len(phases)):
+            phases[i] = (phases[i][0][:OLED_MAX_CHARS],
+                         phases[i][1][:OLED_MAX_CHARS],
+                         phases[i][2][:OLED_MAX_CHARS])
+
+        start = time.ticks_ms()
+        idx = 0
+        n = len(phases)
+        # One full rotation = n * OLED_CYCLE_PROVISIONING_MS, then bail to provisioning.
+        while time.ticks_diff(time.ticks_ms(), start) < n * OLED_CYCLE_PROVISIONING_MS:
+            oled.fill(0)
+            oled.text(phases[idx][0], 0, 0)
+            oled.text(phases[idx][1], 0, 16)
+            oled.text(phases[idx][2], 0, 32)
+            # Heartbeat so the user can tell at a glance it is alive.
+            now = time.ticks_ms()
+            if (now // HEARTBEAT_MS) & 1:
+                oled.pixel(_HEARTBEAT_X, _HEARTBEAT_Y, 1)
+            oled.show()
+            time.sleep_ms(OLED_CYCLE_PROVISIONING_MS)
+            idx = (idx + 1) % n
+        print("OLED: provisioning intro done")
+    except Exception as e:
+        print("OLED setup screen skipped:", e)
+
+
+class OledView:
+    # Drives the 128x64 OLED. Owns its own state; main loop just calls render().
+
+    # States. Strings are interned by the compiler: no per-frame alloc.
+    S_UNPROVISIONED = "unprovisioned"  # pre-WiFi, during onboarding
+    S_CONNECTING = "connecting"        # first WiFi connect attempt
+    S_ONLINE = "online"                # connected, monitoring
+    S_WIFI_LOST = "wifi_lost"          # was connected, now isn't
+    S_RESTARTING = "restarting"        # pre-reset spinner
+
+    def __init__(self, oled):
+        self.oled = oled
+        self.state = self.S_UNPROVISIONED
+        self.phase = 0                # current screen index
+        self.last_phase_ms = 0        # when we last rotated
+        self.last_heartbeat_ms = 0    # for the corner dot
+        self.boot_ms = time.ticks_ms()
+
+    def set_state(self, state):
+        if state != self.state:
+            self.state = state
+            self.phase = 0
+            self.last_phase_ms = time.ticks_ms()
+
+    def _draw_heartbeat(self, now_ms):
+        # Blink once per second. (now // period) is 0/1, gives a 50% duty.
+        if (now_ms // HEARTBEAT_MS) & 1:
+            self.oled.pixel(_HEARTBEAT_X, _HEARTBEAT_Y, 1)
+
+    def _format_kb(self, n_bytes):
+        # Inline so we do not allocate a helper string each call.
+        # DNS packets cap at 512 bytes; we just want a human "X KB" feel.
+        if n_bytes < 1024:
+            return str(n_bytes) + " B"
+        return str(n_bytes // 1024) + " KB"
+
+    def render(self, info, now_ms):
+        # Info is a dict built once per main-loop pass. Do not allocate inside here.
+        if not self.oled:
+            return
+
+        # Rotate the screen on a fixed cadence, regardless of state.
+        # (WiFi-lost has its own timing: see below.)
+        if self.state != self.S_WIFI_LOST and \
+                time.ticks_diff(now_ms, self.last_phase_ms) >= OLED_CYCLE_MS:
+            self.phase = (self.phase + 1)
+            self.last_phase_ms = now_ms
+
+        self.oled.fill(0)
+
+        if self.state == self.S_UNPROVISIONED:
+            self._render_unprovisioned()
+        elif self.state == self.S_CONNECTING:
+            self._render_connecting(info, now_ms)
+        elif self.state == self.S_ONLINE:
+            self._render_online(info, now_ms)
+        elif self.state == self.S_WIFI_LOST:
+            self._render_wifi_lost(now_ms)
+        elif self.state == self.S_RESTARTING:
+            self._render_restarting(now_ms)
+        else:
+            # Unknown state: show nothing rather than crash.
+            pass
+
+        # Heartbeat goes on top of every screen.
+        self._draw_heartbeat(now_ms)
+        try:
+            self.oled.show()
+        except Exception as e:
+            print("Display update error:", e)
+
+    def _render_unprovisioned(self):
+        # Mirrors _show_provisioning_oled phases, just in case the view
+        # is used directly without the pre-roll.
+        phases = [
+            ("Heron", "Plug into PC",  "Open heron.local"),
+            ("Heron", "Setting up...", " "),
+            ("Heron", "Ready",         " "),
+            ("Heron", "Waiting for you", " "),
+        ]
+        i = self.phase % 4
+        l1, l2, l3 = phases[i]
+        self.oled.text(l1[:OLED_MAX_CHARS], 0, 0)
+        self.oled.text(l2[:OLED_MAX_CHARS], 0, 16)
+        self.oled.text(l3[:OLED_MAX_CHARS], 0, 32)
+
+    def _render_connecting(self, info, now_ms):
+        # Two phases: "WiFi: <ssid>" then "Status: connecting".
+        ssid = info.get("ssid", "")
+        if (self.phase & 1) == 0:
+            self.oled.text("Heron", 0, 0)
+            self.oled.text("WiFi:", 0, 16)
+            self.oled.text(ssid[:OLED_MAX_CHARS], 0, 32)
+        else:
+            self.oled.text("Heron", 0, 0)
+            self.oled.text("WiFi...", 0, 16)
+            self.oled.text("connecting", 0, 32)
+
+    def _render_online(self, info, now_ms):
+        # Two alternating screens.
+        # Phase 0: "Heron / N queries / X KB"
+        # Phase 1: "Heron / Wi-Fi: XX% / Uptime: Xh"
+        queries = info.get("queries", 0)
+        kb = info.get("kb", 0)
+        rssi = info.get("rssi", 0)
+        uptime_h = (time.ticks_diff(now_ms, self.boot_ms) // 3600000)
+        if (self.phase & 1) == 0:
+            self.oled.text("Heron", 0, 0)
+            self.oled.text(("Q: " + str(queries))[:OLED_MAX_CHARS], 0, 16)
+            self.oled.text(self._format_kb(kb)[:OLED_MAX_CHARS], 0, 32)
+        else:
+            # Map RSSI to a rough % (0..100). Clamp at 0.
+            pct = rssi + 100
+            if pct < 0:
+                pct = 0
+            elif pct > 100:
+                pct = 100
+            self.oled.text("Heron", 0, 0)
+            self.oled.text(("Wi-Fi: " + str(pct) + "%")[:OLED_MAX_CHARS], 0, 16)
+            self.oled.text(("Uptime: " + str(uptime_h) + "h")[:OLED_MAX_CHARS], 0, 32)
+
+    def _render_wifi_lost(self, now_ms):
+        # Pulse: hardware-invert the panel at 2 Hz. The SSD1306 driver
+        # has invert(n) which flips the whole framebuffer in place :
+        # we just redraw the same text in normal color and toggle.
+        pulse_on = ((now_ms // WIFI_LOST_PULSE_MS) & 1) == 0
+        self.oled.fill(0)
+        self.oled.text("WiFi Lost", 0, 16)
+        self.oled.text("Retrying...", 0, 32)
+        self.oled.invert(1 if pulse_on else 0)
+
+    def _render_restarting(self, now_ms):
+        # Spinner frame from module-level tuple. No allocation.
+        frame = _SPINNER[(now_ms // RESTART_SPINNER_MS) & 3]
+        self.oled.text("Restarting...", 0, 16)
+        self.oled.text(frame, 110, 16)
+
+
+class KnownHardware:
+    # WiFi, OLED, buzzer, main loop. One-stop shop for the hardware.
+    def __init__(self):
+        import devices
+
+        self.pico_id = machine.unique_id()
+        print("Heron Device ID:", self.pico_id.hex())
+
+        self.oled = self._init_oled()
+        self.buzzer = self._init_buzzer()
+        self.view = OledView(self.oled)
+
+        self.wlan = None
+        self.ip_address = None
+        self.was_connected = False
+        self.mac_address = None  # formatted "aa:bb:cc:dd:ee:ff" or None
+        self.device_tracker = devices.DeviceTracker()
+        self.dns_mon = None
+        self.http = None
+
+    def _init_oled(self):
+        try:
+            from machine import Pin, I2C
+            import ssd1306
+
+            print("Initializing I2C Bus 1...")
+            i2c = I2C(1, scl=Pin(OLED_SCL_PIN), sda=Pin(OLED_SDA_PIN), freq=400000)
+            found = i2c.scan()
+
+            if 0x3C in found:
+                print("OLED found at 0x3c. Initializing driver...")
+                oled = ssd1306.SSD1306_I2C(128, 64, i2c, addr=0x3C)
+                oled.fill(0)
+                oled.text("Heron Online", 0, 0)
+                oled.show()
+                return oled
+            print("OLED not detected on I2C Bus 1")
+            return None
+        except Exception as e:
+            print("OLED initialization failed:", e)
+            return None
+
+    def _init_buzzer(self):
+        try:
+            from machine import Pin
+
+            buzzer = machine.PWM(Pin(BUZZER_PIN))
+            buzzer.freq(1000)
+            buzzer.duty_u16(0)
+            print("Buzzer initialized")
+            return buzzer
+        except Exception as e:
+            print("Buzzer init failed:", e)
+            return None
+
+    def beep(self, ms=50):
+        if self.buzzer:
+            self.buzzer.duty_u16(16384)
+            time.sleep_ms(ms)
+            self.buzzer.duty_u16(0)
+
+    def connect_to_wifi(self, ssid, password):
+        import network
+
+        print("Attempting to connect to", ssid)
+
+        # First, scan for networks to see what is available
+        print("Scanning for networks...")
+        wlan_temp = network.WLAN(network.STA_IF)
+        wlan_temp.active(True)
+        networks = wlan_temp.scan()
+        print("Networks found:", len(networks))
+        for n in networks:
+            print(" -", n[0].decode(), "RSSI:", n[3], "sec:", n[5])
+
+        self.wlan = network.WLAN(network.STA_IF)
+        self.wlan.active(True)
+        self.view.set_state(OledView.S_CONNECTING)
+        # We do not render here: the main loop is what calls render. The
+        # state change is enough; the next loop tick will pick it up.
+        if not self.wlan.isconnected():
+            self.wlan.connect(ssid, password)
+            # Wait for association first (this can take time on weak signals)
+            print("Waiting for association...")
+            start = time.time()
+            while not self.wlan.isconnected():
+                time.sleep(0.5)
+                status = self.wlan.status()
+                print("  status:", status, "-", self._wifi_status_name(status))
+                if time.time() - start > WIFI_TIMEOUT_S:
+                    break
+                # Check if we are in a failed state
+                if status == network.STAT_WRONG_PASSWORD:
+                    print("WiFi: wrong password")
+                    return False
+                elif status == network.STAT_NO_AP_FOUND:
+                    print("WiFi: no AP found")
+                    return False
+                elif status == network.STAT_CONNECT_FAIL:
+                    print("WiFi: connect failed")
+                    return False
+
+            # Now wait for IP assignment
+            if self.wlan.isconnected():
+                print("Associated, waiting for IP...")
+                start = time.time()
+                while not self.ip_address and (time.time() - start) < 10:
+                    time.sleep(0.2)
+                    self.ip_address = self.wlan.ifconfig()[0]
+                    if self.ip_address == '0.0.0.0':
+                        self.ip_address = None
+
+        if self.wlan.isconnected():
+            if not self.ip_address:
+                self.ip_address = self.wlan.ifconfig()[0]
+            print("WiFi connected. IP:", self.ip_address)
+            self.was_connected = True
+            # read the pico's own mac from the cyw43 driver. the driver
+            # loaded the mac from OTP during init, so it's available as
+            # soon as the wlan interface is active. format as colon-
+            # separated hex so the dashboard's lookupVendor() can do an
+            # OUI match. on any failure (no wlan, bad bytes) leave
+            # self.mac_address as None -- the API exposes the field as
+            # null in that case.
+            self._read_pico_mac()
+            self._start_mdns()
+            self.view.set_state(OledView.S_ONLINE)
+            self._start_dns_monitor()
+            return True
+
+        print("WiFi connection failed")
+        # Do not drop to wifi_lost on a *first* connect failure: that
+        # would flash the user with a scary screen on a normal config
+        # mistake. Leave the connecting screen up; the main loop will
+        # call us again on the slow retry timer. Return False
+
+    def _wifi_status_name(self, status):
+        # micropython STAT_* constants to human-readable
+        statuses = {
+            0: "IDLE",
+            1: "CONNECTING",
+            2: "WRONG_PASSWORD",
+            3: "NO_AP_FOUND",
+            4: "CONNECT_FAIL",
+            5: "GOT_IP",
+        }
+        return statuses.get(status, "UNKNOWN(" + str(status) + ")")
+
+    def _start_mdns(self):
+        import network
+
+        try:
+            network.hostname(MDNS_HOSTNAME)
+            print("mDNS hostname set:", MDNS_HOSTNAME + ".local")
+        except Exception as e:
+            print("mDNS setup skipped:", e)
+
+    def _start_dns_monitor(self):
+        import dns_monitor
+        import http_server
+
+        if self.dns_mon is None:
+            self.dns_mon = dns_monitor.DNSMonitor(device_tracker=self.device_tracker)
+        if self.dns_mon.start_server():
+            print("DNS monitoring active")
+        else:
+            print("DNS monitor failed to start")
+        self._start_http_server(http_server)
+
+    def _start_http_server(self, http_server):
+        if self.http is None:
+            # Pass the device token so the server can expose it for future auth.
+            import provisioning
+            token = provisioning.load_config().get("device_token")
+            self.http = http_server.HTTPServer(
+                self.dns_mon, self.device_tracker, port=8080,
+                device_token=token, pico_mac=self.mac_address,
+            )
+        self.http.start()
+
+    def _read_pico_mac(self):
+        # pull the pico's own mac out of the cyw43 driver. wlan.config('mac')
+        # returns 6 raw bytes (set from OTP during cyw43_init, or LAA-
+        # generated if no OTP). format as "aa:bb:cc:dd:ee:ff" so the
+        # dashboard's oui.ts lookupVendor() can match. failures are non-
+        # fatal: leave self.mac_address as None and the API exposes null.
+        if not self.wlan:
+            return
+        try:
+            raw = self.wlan.config("mac")
+        except Exception as e:
+            print("pico mac read failed:", e)
+            return
+        if not raw:
+            return
+        try:
+            import devices
+            self.mac_address = devices.format_mac(raw)
+            print("Pico MAC:", self.mac_address)
+        except Exception as e:
+            print("pico mac format failed:", e)
+
+
+hw = None
+
+
+def _draw_restart_screen(view, n_frames=4):
+    # show the spinner for a few frames before machine.reset() wipes the display
+    view.set_state(OledView.S_RESTARTING)
+    start = time.ticks_ms()
+    # One full spinner rotation = 4 * RESTART_SPINNER_MS.
+    duration = n_frames * RESTART_SPINNER_MS
+    while time.ticks_diff(time.ticks_ms(), start) < duration:
+        # Build a tiny info dict: the spinner screen ignores it, but
+        # keeping the call shape uniform avoids branching in the view.
+        view.render({}, time.ticks_ms())
+        time.sleep_ms(RESTART_SPINNER_MS)
+
+
+def run():
+    global hw
+
+    # Only provisioning is required for first-time USB setup. Import the rest
+    # after Wi-Fi credentials exist so a partial lib/ copy cannot brick setup.
+    import provisioning
+
+    print("Starting Heron firmware...")
+
+    if not provisioning.is_provisioned():
+        # Show setup screen so user knows device is alive before serial
+        _show_provisioning_oled()
+        # Serial first: OLED/I2C init can delay USB command handling.
+        provisioning.enter_provisioning_mode()
+        print("Rebooting after provisioning...")
+        # Build a throwaway view just for the spinner: the device is
+        # about to reset, no need to spin up the full hardware class.
+        try:
+            from machine import Pin, I2C
+            import ssd1306
+            i2c = I2C(1, scl=Pin(OLED_SCL_PIN), sda=Pin(OLED_SDA_PIN), freq=400000)
+            if 0x3C in i2c.scan():
+                oled = ssd1306.SSD1306_I2C(128, 64, i2c, addr=0x3C)
+                view = OledView(oled)
+                _draw_restart_screen(view)
+        except Exception as e:
+            print("Restart screen skipped:", e)
+        machine.reset()
+        return
+
+    hw = KnownHardware()
+    hw.beep(200)
+    hw.view.set_state(OledView.S_ONLINE)
+
+    cfg = provisioning.load_config()
+    # Generate a device token on first boot if one does not exist yet.
+    # Unused by the consumer dashboard now: the primitive is here so
+    # auth can be added later without a firmware reflash on deployed devices.
+    provisioning.ensure_device_token()
+    hw.connect_to_wifi(cfg.get("ssid"), cfg.get("pass"))
+
+    # load saved device names from flash so they survive reboots.
+    hw.device_tracker.load_saved_names()
+
+    last_wifi_check = 0
+    last_flush_check = 0
+    while True:
+        now = time.ticks_ms()
+
+        if hw.dns_mon:
+            dns_packet = hw.dns_mon.check_for_packets()
+            if dns_packet:
+                print("DNS Request:", dns_packet["domain"], "from", dns_packet["source"])
+                hw.beep(50)
+
+        if hw.http:
+            hw.http.poll()
+
+        # periodic flush to flash (internal gate handles actual writes)
+        if time.ticks_diff(now, last_flush_check) >= 300000:
+            if hw.dns_mon:
+                hw.dns_mon.maybe_flush()
+            last_flush_check = now
+
+        # Build the small info dict the view needs. Done once per loop
+        # pass; the view itself does not allocate on the hot path.
+        info = {
+            "queries": len(hw.dns_mon.dns_requests) if (hw.dns_mon and hw.dns_mon.dns_requests) else 0,
+            "kb": 0,  # byte count not yet tracked; placeholder for the format
+            "rssi": hw.wlan.status("rssi") if hw.wlan and hw.wlan.isconnected() else 0,
+            "ssid": cfg.get("ssid", ""),
+        }
+        if hw.ip_address and hw.wlan and hw.wlan.isconnected():
+            hw.view.set_state(OledView.S_ONLINE)
+        elif hw.was_connected:
+            hw.view.set_state(OledView.S_WIFI_LOST)
+        # else: keep current state (CONNECTING or initial)
+
+        hw.view.render(info, now)
+
+        if time.ticks_diff(now, last_wifi_check) >= 30000:
+            if not hw.wlan or not hw.wlan.isconnected():
+                hw.connect_to_wifi(cfg.get("ssid"), cfg.get("pass"))
+            last_wifi_check = now
+
+        time.sleep_ms(100)
+
+
+if __name__ == "__main__":
+    run()
