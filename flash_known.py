@@ -41,54 +41,39 @@ import uuid
 
 # Resolve paths relative to this script (lives in backend/).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-FIRMWARE_DIR = os.path.join(SCRIPT_DIR, "..", "heron", "firmware")
+FIRMWARE_DIR = os.path.join(SCRIPT_DIR, "..", "firmware")
 DEFAULT_UF2 = os.path.join(FIRMWARE_DIR, "micropython-pico2.uf2")
 
 def find_pico_serial():
-    """Find the Pico's serial port (/dev/ttyACMx on Linux)."""
+    """Find the Pico's serial port. Prefers /dev/ttyACM* but falls back
+    to mpremote auto-discovery (handles USB CDC + mass-storage modes)."""
     candidates = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")
-    if not candidates:
-        return None
-    # If multiple, prefer the first: user should only have one plugged in. Return candidates[0]
-
-
-def find_pico_mount():
-    """Find the Pico's mass storage mount point (BOOTSEL mode)."""
-    # On Linux, the Pico shows up as a block device when in BOOTSEL mode.
-    # Check mounted filesystems for something that looks like a Pico.
+    if candidates:
+        return candidates[0]
     try:
-        with open("/proc/mounts") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) >= 2:
-                    mount_point = parts[1]
-                    # Pico mounts with a FAT filesystem, usually labeled "RPI-RP2"
-                    if "RPI-RP" in mount_point.upper() or "RP2" in mount_point.upper():
-                        return mount_point
-        # Fallback: check common mount points
-        for d in ["/run/media", "/media"]:
-            for root, dirs, _ in os.walk(d):
-                for dir_name in dirs:
-                    full = os.path.join(root, dir_name)
-                    if "RPI" in dir_name.upper() or "PICO" in dir_name.upper():
-                        return full
-    except Exception:
+        r = subprocess.run(["mpremote", "exec", "print('ok')"],
+                            capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and "ok" in r.stdout:
+            return "auto"
+    except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     return None
 
 
-def wait_for_bootsel(timeout=120):
-    """Wait for the Pico to appear in BOOTSEL mode (mass storage)."""
-    print(f"Waiting for Pico in BOOTSEL mode (hold BOOTSEL, plug in USB)... "
-          f"timeout {timeout}s")
-    start = time.time()
-    while time.time() - start < timeout:
-        mount = find_pico_mount()
-        if mount:
-            print(f"Found Pico at {mount}")
-            return mount
-        time.sleep(0.5)
-    return None
+def mpremote(port, *args, timeout=15):
+    """Run an mpremote command on the given port."""
+    if port == "auto":
+        cmd = ["mpremote"] + list(args)
+    else:
+        cmd = ["mpremote", "connect", port] + list(args)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            print(f"mpremote error: {result.stderr.strip()}")
+        return result
+    except subprocess.TimeoutExpired:
+        print(f"mpremote timeout: {' '.join(cmd)}")
+        return None
 
 
 def wait_for_serial(timeout=30):
@@ -102,37 +87,6 @@ def wait_for_serial(timeout=30):
             return port
         time.sleep(0.5)
     return None
-
-
-def flash_uf2(uf2_path, mount_point):
-    """Copy the UF2 file to the Pico's mass storage to flash it."""
-    if not os.path.exists(uf2_path):
-        print(f"ERROR: UF2 file not found at {uf2_path}")
-        print("Download from https://micropython.org/download/RPI-PICO2-W/")
-        return False
-    dest = os.path.join(mount_point, "firmware.uf2")
-    print(f"Flashing {os.path.basename(uf2_path)} to {mount_point}...")
-    try:
-        subprocess.run(["cp", uf2_path, dest], check=True)
-        # Pico reboots automatically after UF2 copy
-        print("UF2 copied. Pico will reboot...")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"Flash failed: {e}")
-        return False
-
-
-def mpremote(port, *args, timeout=15):
-    """Run an mpremote command on the given port."""
-    cmd = ["mpremote", "connect", port] + list(args)
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        if result.returncode != 0:
-            print(f"mpremote error: {result.stderr.strip()}")
-        return result
-    except subprocess.TimeoutExpired:
-        print(f"mpremote timeout: {' '.join(cmd)}")
-        return None
 
 
 def copy_firmware(port):
@@ -168,14 +122,23 @@ def copy_firmware(port):
     return True
 
 
-def inject_config(port):
-    """Write config.json to the device with Wi-Fi placeholder.
-    Device identity (private key, cert) is injected separately via key burn."""
+def inject_config(port, ssid=None, wifi_pass=None):
+    """Write config.json to the device.
+
+    Always writes a fresh device_token. If ssid and wifi_pass are provided,
+    they are written so the device can boot straight into monitoring mode
+    without going through the PWA. Device identity (private key, cert) is
+    injected separately via key burn.
+    """
     config = {
         "device_token": secrets.token_hex(32),
     }
+    if ssid:
+        config["ssid"] = ssid
+    if wifi_pass:
+        config["pass"] = wifi_pass
     config_json = json.dumps(config)
-    print(f"Injecting config.json (device token)...")
+    print(f"Injecting config.json (device token{'+ Wi-Fi' if ssid else ''})...")
     escaped = config_json.replace("'", "\\'")
     r = mpremote(port, "exec",
                  f"open('/config.json','w').write('{escaped}')",
@@ -184,6 +147,26 @@ def inject_config(port):
         return False
     print("Config injected.")
     return True
+
+
+def load_update_public_key():
+    """Load the 65-byte raw update public key for device burn."""
+    keygen_path = os.path.join(SCRIPT_DIR, "keygen.py")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("keygen", keygen_path)
+    keygen_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(keygen_mod)
+    bin_path = keygen_mod.UPDATE_PUBLIC_BIN_PATH
+    if not os.path.exists(bin_path):
+        print(f"ERROR: Update public key not found at {bin_path}")
+        print("Run: python keygen.py --init-update")
+        return None
+    with open(bin_path, "rb") as f:
+        pub = f.read()
+    if len(pub) != 65:
+        print(f"ERROR: Update public key must be 65 bytes, got {len(pub)}")
+        return None
+    return pub
 
 
 def burn_device_keys(port, device_keys):
@@ -256,6 +239,77 @@ def burn_device_keys(port, device_keys):
         return False
 
     print("Device keys burned and verified.")
+    return True
+
+
+def burn_update_key_only(port, update_pub):
+    """Burn only the firmware-update public key into an already-provisioned device.
+
+    This is the migration path for devices that were manufactured before the
+    update-key system existed. The device identity (attestation keys) is left
+    untouched.
+    """
+    print("Burning update public key into already-provisioned device...")
+
+    # Must be on OTP backend (same safety rule as device keys).
+    r = mpremote(port, "exec",
+                 "import otp_keys; print(otp_keys._BACKEND)",
+                 timeout=10)
+    if not r or r.returncode != 0:
+        print(f"Backend check failed: {r.stderr if r else 'no response'}")
+        return False
+    backend = r.stdout.strip().strip("'").strip('"')
+    if backend != "otp":
+        print(f"ERROR: device backend is '{backend}', not 'otp'.")
+        print("  Re-flash a MicroPython build that exposes machine.OTP.")
+        return False
+    print(f"  backend: {backend}")
+
+    # Refuse if update key already present.
+    r = mpremote(port, "exec",
+                 "import otp_keys; print(otp_keys.has_update_key())",
+                 timeout=10)
+    if not r or r.returncode != 0:
+        print(f"Pre-burn check failed: {r.stderr if r else 'no response'}")
+        return False
+    if r.stdout.strip().lower() == "true":
+        print("ERROR: device already has an update key burned.")
+        print("  OTP is one-time-write. Use a fresh Pico or accept the existing key.")
+        return False
+
+    pub_hex = update_pub.hex()
+    exec_code = (
+        f"import otp_keys; "
+        f"print(otp_keys.burn_update_key(bytes.fromhex('{pub_hex}'), 0))"
+    )
+    r = mpremote(port, "exec", exec_code, timeout=15)
+    if not r or r.returncode != 0:
+        print(f"Update key burn failed: {r.stderr if r else 'no response'}")
+        return False
+    if r.stdout.strip().lower() != "true":
+        print("ERROR: burn_update_key returned False on device")
+        return False
+
+    # read-back verify
+    r = mpremote(port, "exec",
+                 "import otp_keys; print(otp_keys.has_update_key())",
+                 timeout=10)
+    if not r or r.returncode != 0 or r.stdout.strip().lower() != "true":
+        print("ERROR: read-back verify failed: has_update_key is False")
+        return False
+    r = mpremote(port, "exec",
+                 "import ubinascii, otp_keys; "
+                 "v = otp_keys.get_update_pubkey(); "
+                 "print(ubinascii.hexlify(v).decode() if v else '')",
+                 timeout=10)
+    if not r or r.returncode != 0:
+        print("ERROR: read-back verify failed: could not read update pubkey")
+        return False
+    if r.stdout.strip() != pub_hex:
+        print("ERROR: read-back verify failed: update pubkey mismatch")
+        return False
+
+    print("Update key burned and verified.")
     return True
 
 
@@ -347,7 +401,32 @@ def main():
                         help=f"Path to MicroPython UF2 (default: {DEFAULT_UF2})")
     parser.add_argument("--skip-uf2", action="store_true",
                         help="Skip UF2 flashing (device already has MicroPython)")
+    parser.add_argument("--ssid", default=None,
+                        help="Wi-Fi SSID to write into /config.json (default: none)")
+    parser.add_argument("--pass", dest="wifi_pass", default=None,
+                        help="Wi-Fi password to write into /config.json (default: none)")
+    parser.add_argument("--burn-update-key", action="store_true",
+                        help="Burn only the update key into an already-provisioned device (migration)")
     args = parser.parse_args()
+
+    if args.burn_update_key:
+        # Migration path: device already has identity keys; just add update key.
+        update_pub = load_update_public_key()
+        if update_pub is None:
+            sys.exit(1)
+        port = wait_for_serial()
+        if not port:
+            print("ERROR: Pico serial port not found. Unplug and replug (without BOOTSEL).")
+            sys.exit(1)
+        if not burn_update_key_only(port, update_pub):
+            print("ERROR: Update key burn failed.")
+            sys.exit(3)
+        print()
+        print("=" * 50)
+        print("  UPDATE KEY BURNED")
+        print("=" * 50)
+        print()
+        return
 
     # Step 1: Generate device cryptographic keys
     from keygen import generate_device
@@ -356,14 +435,11 @@ def main():
 
     # Step 2: Flash UF2 (or skip)
     if not args.skip_uf2:
-        mount = wait_for_bootsel()
-        if not mount:
-            print("ERROR: Pico not found in BOOTSEL mode.")
-            sys.exit(1)
-        if not flash_uf2(args.uf2, mount):
-            sys.exit(1)
-        print("Waiting for Pico to reboot after flash...")
-        time.sleep(3)
+        print("ERROR: UF2 flashing requires mass-storage BOOTSEL mode,")
+        print("  which is not available on this system. Flash the UF2")
+        print("  manually by copying it to the Pico's mass storage drive,")
+        print("  then re-run with --skip-uf2.")
+        sys.exit(1)
 
     # Step 3: Wait for serial port
     port = wait_for_serial()
@@ -385,7 +461,7 @@ def main():
     # Existing devices that still have sticker_code in their config.json
     # will lose it naturally on next re-provision. No migration script needed
     # -- the old key is harmless and the firmware doesn't read it.
-    if not inject_config(port):
+    if not inject_config(port, ssid=args.ssid, wifi_pass=args.wifi_pass):
         print("ERROR: Config injection failed.")
         sys.exit(3)
 
@@ -394,7 +470,16 @@ def main():
         print("ERROR: Key burn failed.")
         sys.exit(3)
 
-    # Step 7: Serial verify
+    # Step 7: Burn firmware-update public key
+    update_pub = load_update_public_key()
+    if update_pub is None:
+        print("ERROR: Could not load update public key.")
+        sys.exit(3)
+    if not burn_update_key_only(port, update_pub):
+        print("ERROR: Update key burn failed.")
+        sys.exit(3)
+
+    # Step 8: Serial verify
     if not serial_verify(port):
         print("ERROR: Serial verification failed.")
         sys.exit(4)
