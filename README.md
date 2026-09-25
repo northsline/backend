@@ -14,6 +14,14 @@ and monitoring your network from the terminal.
 - `flash_known.py`: One-command manufacturing: generate device keys, flash
   MicroPython UF2, copy firmware, burn keys to the device, verify, and
   generate a printable serial sticker (PNG + optional A4 PDF).
+- Interrupted identity burns retain a chip-bound, mode-0600 pending key bundle
+  under `~/.heron/pending-burns/`. Treat these files as private-key material;
+  the script removes a record only after device read-back verification.
+  Manufacturing hosts may set `HERON_PENDING_KEYS_DIR` to a mode-0700,
+  RAM-backed mount (for example `/run/heron/pending-burns`) to reduce SSD
+  residue. A tmpfs is lost on host reboot; if a Pico has partial OTP data but
+  its matching record is gone, the script fails closed and the board must be
+  quarantined rather than assigned a replacement identity.
 - `sticker.py`: Generate a printable device serial sticker (QR code +
   serial number). Called automatically by `flash_known.py`, or standalone
   for reprinting lost stickers.
