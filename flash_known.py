@@ -3,12 +3,12 @@
 flash_known.py. One-command manufacturing script for Heron.
 
 Does the full per-device setup in one shot:
-  1. Generate device cryptographic keys (ECDSA P-256 key pair + root-signed cert)
-  2. Wait for Pico in BOOTSEL mode, flash MicroPython UF2
-  3. Copy firmware (main.py + lib/) to the device
+  1. Wait for Pico in BOOTSEL mode, flash MicroPython UF2
+  2. Copy firmware and stable A/B bootstrap to the device
+  3. Read Pico unique ID and persist/reuse its pending identity key bundle
   4. Inject /config.json with device token
-  5. Burn device keys (private key, public key, serial, certificate) to key storage
-  6. Serial verify with the identify command (checks keys are present)
+  5. Burn device keys and update public key to OTP
+  6. Serial verify; remove the pending key bundle only after success
   7. Print the device serial number for labeling
 
 Usage:
@@ -37,12 +37,15 @@ import json
 import glob
 import subprocess
 import secrets
-import uuid
 
 # Resolve paths relative to this script (lives in backend/).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FIRMWARE_DIR = os.path.join(SCRIPT_DIR, "..", "firmware")
 DEFAULT_UF2 = os.path.join(FIRMWARE_DIR, "micropython-pico2.uf2")
+PENDING_KEYS_DIR = os.environ.get(
+    "HERON_PENDING_KEYS_DIR",
+    os.path.join(os.path.expanduser("~"), ".heron", "pending-burns"),
+)
 
 def find_pico_serial():
     """Find the Pico's serial port. Prefers /dev/ttyACM* but falls back
@@ -76,6 +79,145 @@ def mpremote(port, *args, timeout=15):
         return None
 
 
+def read_device_chip_id(port):
+    """Read the hardware unique ID used to bind a retry key bundle to a Pico."""
+    r = mpremote(port, "exec", "import machine; print(machine.unique_id().hex())", timeout=10)
+    if not r or r.returncode != 0:
+        return None
+    lines = [line.strip().strip("'\"") for line in r.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    chip_id = lines[-1].lower()
+    try:
+        raw = bytes.fromhex(chip_id)
+    except ValueError:
+        return None
+    return chip_id if len(raw) >= 4 else None
+
+
+def _device_otp_state(port):
+    code = (
+        "import json, otp_keys; "
+        "print(json.dumps({'backend': otp_keys._BACKEND, "
+        "'has_keys': otp_keys.has_keys(), "
+        "'partial': otp_keys.has_partial_keys()}))"
+    )
+    r = mpremote(port, "exec", code, timeout=10)
+    if not r or r.returncode != 0:
+        return None
+    try:
+        # mpremote versions may add a banner; parse the final output line.
+        lines = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+        return json.loads(lines[-1]) if lines else None
+    except (ValueError, json.JSONDecodeError):
+        return None
+
+
+def _pending_key_path(chip_id):
+    if not chip_id or any(c not in "0123456789abcdef" for c in chip_id.lower()):
+        raise ValueError("invalid chip ID for pending-key filename")
+    return os.path.join(PENDING_KEYS_DIR, chip_id.lower() + ".json")
+
+
+def _decode_pending_keys(record, expected_chip_id):
+    if not isinstance(record, dict) or record.get("chip_id") != expected_chip_id:
+        raise ValueError("pending key record belongs to a different Pico")
+    try:
+        keys = {
+            "private_key": bytes.fromhex(record["private_key"]),
+            "public_key": bytes.fromhex(record["public_key"]),
+            "serial": bytes.fromhex(record["serial"]),
+            "serial_hex": record["serial_hex"],
+            "certificate": bytes.fromhex(record["certificate"]),
+        }
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError("pending key record is malformed") from e
+    if (len(keys["private_key"]) != 32 or len(keys["public_key"]) != 65 or
+            keys["public_key"][0] != 0x04 or len(keys["serial"]) != 8 or
+            not 1 <= len(keys["certificate"]) <= 148 or
+            keys["serial_hex"] != keys["serial"].hex()):
+        raise ValueError("pending key record has invalid field lengths")
+    return keys
+
+
+def _save_pending_keys(path, chip_id, keys):
+    os.makedirs(PENDING_KEYS_DIR, mode=0o700, exist_ok=True)
+    os.chmod(PENDING_KEYS_DIR, 0o700)
+    record = {
+        "chip_id": chip_id,
+        "private_key": keys["private_key"].hex(),
+        "public_key": keys["public_key"].hex(),
+        "serial": keys["serial"].hex(),
+        "serial_hex": keys["serial_hex"],
+        "certificate": keys["certificate"].hex(),
+    }
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as f:
+        os.chmod(temp, 0o600)
+        json.dump(record, f, separators=(",", ":"))
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(temp, 0o600)
+    os.replace(temp, path)
+    os.chmod(path, 0o600)
+    dir_fd = os.open(PENDING_KEYS_DIR, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def get_or_create_pending_keys(port):
+    """Load or durably save this Pico's identity before any OTP write."""
+    chip_id = read_device_chip_id(port)
+    if chip_id is None:
+        print("ERROR: could not read Pico unique ID; refusing to generate burn keys")
+        return None, None
+    path = _pending_key_path(chip_id)
+
+    if os.path.exists(path):
+        try:
+            os.chmod(path, 0o600)
+            with open(path, "r", encoding="utf-8") as f:
+                keys = _decode_pending_keys(json.load(f), chip_id)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            print(f"ERROR: pending OTP key record is unreadable: {e}")
+            print("  Do not delete it or generate replacement keys; investigate first.")
+            return None, None
+        print(f"Reusing pending identity for Pico {chip_id}: serial={keys['serial_hex']}")
+        return keys, path
+
+    state = _device_otp_state(port)
+    if state is None or state.get("backend") != "otp":
+        print("ERROR: OTP backend could not be verified; refusing to create burn keys")
+        return None, None
+    if state.get("has_keys") or state.get("partial") is not False:
+        print("ERROR: this Pico already has or may have partial identity OTP data")
+        print("  No pending key record exists, so a replacement identity is unsafe.")
+        return None, None
+
+    from keygen import generate_device
+    keys = generate_device()
+    try:
+        _save_pending_keys(path, chip_id, keys)
+    except OSError as e:
+        print(f"ERROR: could not durably save pending key record: {e}")
+        print("  No OTP writes have been attempted.")
+        return None, None
+    print(f"Saved mode-0600 pending OTP key record: {path}")
+    return keys, path
+
+
+def remove_pending_keys(path):
+    """Remove the local retry record after full device verification."""
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError as e:
+        print("WARNING: device verified, but pending-key record remains:", e)
+
+
 def wait_for_serial(timeout=30):
     """Wait for the Pico to appear as a serial port (after reboot)."""
     print(f"Waiting for Pico serial port... Timeout {timeout}s")
@@ -90,14 +232,24 @@ def wait_for_serial(timeout=30):
 
 
 def copy_firmware(port):
-    """Copy main.py and lib/ to the device."""
+    """Copy the stable A/B bootstrap and the legacy recovery app."""
     print("Copying firmware to device...")
-    # Copy main.py
+    # Keep the root-level app and libraries as a recovery fallback. boot.py
+    # is copied last so an interrupted factory copy does not activate a
+    # bootstrap before its helper and app files are in place.
     main_py = os.path.join(FIRMWARE_DIR, "main.py")
     if not os.path.exists(main_py):
         print(f"ERROR: main.py not found at {main_py}")
         return False
     r = mpremote(port, "fs", "cp", main_py, ":main.py")
+    if not r or r.returncode != 0:
+        return False
+
+    helper_py = os.path.join(FIRMWARE_DIR, "fwslots.py")
+    if not os.path.exists(helper_py):
+        print(f"ERROR: fwslots.py not found at {helper_py}")
+        return False
+    r = mpremote(port, "fs", "cp", helper_py, ":fwslots.py")
     if not r or r.returncode != 0:
         return False
 
@@ -118,7 +270,15 @@ def copy_firmware(port):
                 print(f"  failed to copy {fname}")
                 return False
 
-    print("Firmware copied.")
+    boot_py = os.path.join(FIRMWARE_DIR, "boot.py")
+    if not os.path.exists(boot_py):
+        print(f"ERROR: boot.py not found at {boot_py}")
+        return False
+    r = mpremote(port, "fs", "cp", boot_py, ":boot.py")
+    if not r or r.returncode != 0:
+        return False
+
+    print("Firmware and A/B bootstrap copied.")
     return True
 
 
@@ -201,9 +361,9 @@ def burn_device_keys(port, device_keys):
         return False
     print(f"  backend: {backend}")
 
-    # step 2: refuse to re-burn a device that already has keys. OTP is
-    # one-time-write and we cannot tell apart "burned today" from
-    # "burned last month" -- the safe move is to fail loudly.
+    # step 2: an interrupted host run may reach this point after the identity
+    # magic was committed. Accept only an exact read-back match to the saved
+    # per-chip pending key record; never try to overwrite a different identity.
     r = mpremote(port, "exec",
                  "import otp_keys; print(otp_keys.has_keys())",
                  timeout=10)
@@ -211,10 +371,11 @@ def burn_device_keys(port, device_keys):
         print(f"Pre-burn check failed: {r.stderr if r else 'no response'}")
         return False
     if r.stdout.strip().strip("'").strip('"').lower() == "true":
-        print("ERROR: device already has keys burned. OTP is one-time-write.")
-        print("  Use a fresh Pico, or accept that this device cannot be")
-        print("  re-keyed. Its current keys remain valid -- it is just")
-        print("  not the keys we just generated.")
+        if verify_burn(port, device_keys):
+            print("Identity OTP already matches this Pico's pending key record.")
+            return True
+        print("ERROR: device has committed keys that do not match the pending record.")
+        print("  Refusing to overwrite or replace a one-time identity.")
         return False
 
     # step 3: burn.
@@ -428,12 +589,7 @@ def main():
         print()
         return
 
-    # Step 1: Generate device cryptographic keys
-    from keygen import generate_device
-    device_keys = generate_device()
-    print(f"Generated device keys: serial={device_keys['serial_hex']}")
-
-    # Step 2: Flash UF2 (or skip)
+    # Step 1: Flash UF2 (or skip)
     if not args.skip_uf2:
         print("ERROR: UF2 flashing requires mass-storage BOOTSEL mode,")
         print("  which is not available on this system. Flash the UF2")
@@ -441,16 +597,24 @@ def main():
         print("  then re-run with --skip-uf2.")
         sys.exit(1)
 
-    # Step 3: Wait for serial port
+    # Step 2: Wait for serial port
     port = wait_for_serial()
     if not port:
         print("ERROR: Pico serial port not found. Unplug and replug (without BOOTSEL).")
         sys.exit(1)
 
-    # Step 4: Copy firmware
+    # Step 3: Copy firmware
     if not copy_firmware(port):
         print("ERROR: Firmware copy failed.")
         sys.exit(2)
+
+    # Step 4: Create durable per-chip identity material before any OTP write.
+    # If the host or Pico loses power mid-burn, rerunning the script loads the
+    # same private key, public key, serial, and certificate for this chip ID.
+    device_keys, pending_key_path = get_or_create_pending_keys(port)
+    if device_keys is None:
+        sys.exit(3)
+    print(f"Device identity ready: serial={device_keys['serial_hex']}")
 
     # Step 5: Inject config (device token only).
     #
@@ -483,6 +647,11 @@ def main():
     if not serial_verify(port):
         print("ERROR: Serial verification failed.")
         sys.exit(4)
+
+    # The record is plaintext private key material (mode 0600, under
+    # ~/.heron/pending-burns). Remove it after identity + update-key verify.
+    # Unlinking does not guarantee secure erasure from SSD-backed storage.
+    remove_pending_keys(pending_key_path)
 
     # Done
     print()

@@ -97,8 +97,18 @@ def test_burn_rejects_already_burned_device():
     fake = FakeMpremote(backend="otp", already_has_keys=True)
     with mock.patch.object(flash_known, "mpremote", side_effect=fake):
         result = flash_known.burn_device_keys("/dev/null", keys)
+    assert result is True
+    print("  PASS: exact pending key record resumes after identity commit")
+
+
+def test_burn_refuses_existing_different_identity():
+    keys = make_keys()
+    fake = FakeMpremote(backend="otp", already_has_keys=True,
+                        verify_succeeds=False)
+    with mock.patch.object(flash_known, "mpremote", side_effect=fake):
+        result = flash_known.burn_device_keys("/dev/null", keys)
     assert result is False
-    print("  PASS: burn refuses already-keyed device")
+    print("  PASS: already-keyed device with mismatched record is refused")
 
 
 def test_burn_happy_path():
@@ -142,6 +152,7 @@ def main():
     print()
     test_burn_rejects_flash_backend()
     test_burn_rejects_already_burned_device()
+    test_burn_refuses_existing_different_identity()
     test_burn_happy_path()
     test_burn_fails_on_readback_mismatch()
     test_burn_fails_on_burn_keys_failure()
